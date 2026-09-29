@@ -35,9 +35,9 @@ COMMON="--arch deepseek --scale tiny --optimizer muon --z-loss-coef 1e-4 \
 
 submit () {   # submit <job-name> <extra flags...>
     local name="$1"; shift
-    python csub.py -n "$name" -g 1 --node-type h200 --train -t 2h \
+    python3 csub.py -n "$name" -g 1 --node-type h200 --train -t 2h \
         --command "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
-source looped-moe-experiment/.venv/bin/activate && cd looped-moe-experiment && mkdir -p logs && \
+source looped-moe/.venv/bin/activate && cd looped-moe && mkdir -p logs && \
 python imbalance_train.py $COMMON $* 2>&1 | tee -a logs/$name.log"
 }
 

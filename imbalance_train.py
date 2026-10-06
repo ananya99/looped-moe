@@ -750,6 +750,14 @@ def train(args):
         stats_writer = ExpertStatsWriter(save_dir / f"{run_name}_expert_stats.jsonl")
         print(f"  Per-expert records: {stats_writer.path}")
 
+    # Per-micro-batch, per-rank counts: input for the expert-parallel simulator
+    # (per-rank max/mean under different placements) and the micro-batch vs
+    # global-batch comparison. One record holds [ranks, micro-batches, layers, experts].
+    mb_writer = None
+    if master_process and args.microbatch_stats_every and tracker is not None:
+        mb_writer = ExpertStatsWriter(save_dir / f"{run_name}_microbatch_counts.jsonl")
+        print(f"  Micro-batch counts: {mb_writer.path}")
+
     # --- wandb ---
     run = None
     if HAS_WANDB and not args.no_wandb and master_process:
@@ -877,6 +885,20 @@ def train(args):
             if master_process and (step % args.expert_stats_every == 0
                                    or step < args.expert_stats_dense_until):
                 load_metrics = tracker.layer_metrics()
+                load_metrics.update(tracker.microbatch_metrics())
+            # Rank-independent condition: microbatch_counts(gather=True) is a
+            # collective, so every rank must take this branch on the same steps.
+            if args.microbatch_stats_every and (step % args.microbatch_stats_every == 0
+                                                or step < args.microbatch_stats_dense_until):
+                mbc = tracker.microbatch_counts(gather=True)
+                if mb_writer is not None and mbc is not None:
+                    mb_writer.write({
+                        "step": step,
+                        "ranks": mbc.size(0), "micro_batches": mbc.size(1),
+                        "layers": tracker.layer_ids(), "top_k": top_k,
+                        "tokens_per_micro_batch": tcfg["batch_size"] * tcfg["seq_len"],
+                        "counts": mbc.tolist(),   # [ranks][micro_batches][layers][experts]
+                    })
 
         if per_expert_lr_active and lr_counts:
             # The schedule above reset every group to the base rate, so these
@@ -977,6 +999,8 @@ def train(args):
         tracker.remove()
     if stats_writer is not None:
         stats_writer.close()
+    if mb_writer is not None:
+        mb_writer.close()
 
     # --- Final ---
     final_loss, final_ppl = evaluate(model, eval_batches, device)
@@ -1080,6 +1104,10 @@ def main():
                    help="Log every step until here; imbalance is largest early")
     p.add_argument("--expert-stats-full-every", type=int, default=50,
                    help="Per-expert JSONL dump cadence; 0 disables")
+    p.add_argument("--microbatch-stats-every", type=int, default=25,
+                   help="Per-micro-batch, per-rank count dump cadence (JSONL); 0 disables")
+    p.add_argument("--microbatch-stats-dense-until", type=int, default=50,
+                   help="Dump micro-batch counts every step until here (collapse phase)")
     p.add_argument("--track-expert-drift", action="store_true",
                    help="Also track ||w - w_init|| (keeps a bf16 copy on device)")
 

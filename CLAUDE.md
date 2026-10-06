@@ -60,13 +60,33 @@ python eval_downstream.py --ckpt checkpoints/<run>_step5000.pt --tie-group-size 
 ```
 
 `QUICKSTART.md`, `submit_ablation_runs.sh` and `submit_imbalance_runs.sh` are lists of
-`csub.py ...` cluster submissions. **`csub.py` is not in this repo** — it is the authors' EPFL
-cluster wrapper. Strip the `csub.py -n ... --command "..."` envelope to get the runnable
-`python`/`torchrun` command.
+`csub.py ...` cluster submissions. **`csub.py` is not in this repo** — it is the EPFL cluster
+wrapper, locally at `/Users/ananyagupta/repos/getting-started/csub.py`. Strip the
+`csub.py -n ... --command "..."` envelope to get the runnable `python`/`torchrun` command.
 
 `--tie-group-size` must match the value used at training time when evaluating, or the
 checkpoint's state dict will not load. Checkpoints from `imbalance_train.py` are always
 untied, so they need `--tie-group-size 1`.
+
+## Cluster access
+
+Runs, logs, checkpoints and the per-expert JSONLs live on the EPFL RunAI cluster, not in this
+repo. Home there is `/mloscratch/homes/anagupta`; this repo is at
+`/mloscratch/homes/anagupta/looped-moe`.
+
+Inspecting artefacts needs no GPU — start a CPU-only pod:
+
+```bash
+python /Users/ananyagupta/repos/getting-started/csub.py -n dev-cpu
+
+runai describe job dev-cpu        # check job status
+runai logs dev-cpu                # view logs
+runai exec dev-cpu -it -- zsh     # connect to the pod
+runai delete job dev-cpu          # delete it when done
+```
+
+The same `runai` commands take any job name, so they also work on the training jobs submitted
+by `submit_imbalance_runs.sh` / `submit_ablation_runs.sh`.
 
 ---
 
@@ -170,9 +190,11 @@ based on it?** Imbalance is largest early in training, so short runs are the rig
 
 ## Why this needs its own trainer
 
-Muon's Newton-Schulz orthogonalisation normalises the update to unit spectral norm, so the
-*magnitude* of an expert's step is independent of how many tokens it saw — only the direction
-and its noise level differ. Two consequences shape the whole design:
+Muon's Newton-Schulz orthogonalisation normalises the update's singular values, so it is
+invariant to gradient *scale*. It is **not** invariant to gradient *rank*: an expert that saw
+`n` tokens has a rank-≤`n` gradient, so its update norm goes as `sqrt(min(n, d))` (measured in
+`RESULTS.md` §8 — the original "step size is independent of token count" premise was wrong).
+Two consequences shape the whole design:
 
 - Scaling an expert's **gradient** does nothing; only its **learning rate** survives
   normalisation. Hence per-expert parameter groups rather than gradient hooks.
@@ -232,28 +254,34 @@ switched off (`--aux-loss-coef 0`, the imbalanced regime) while the router z-los
 
 ## Running the experiment
 
-`submit_imbalance_runs.sh` is the 8-run, ~1h-each matrix: Section A measures (aux coefficient
+`submit_imbalance_runs.sh` is the 8-run matrix (**~4.3–5 h each** on one H200, not the ~1 h
+its header claims; peak VRAM 93.7 GB): Section A measures (aux coefficient
 0.01 / 0.001 / 0), Section B intervenes in the imbalanced regime (freeze-dead, alpha 0.5, 1,
 -0.5), Section C controls with AdamW.
 
 **Compare these runs on `train/lm_loss`, never `train/loss`** — they differ in their aux
 coefficient, so only the pure cross-entropy is comparable across cells.
 
-Run `imb-freeze` before the alpha sweep. Freezing zero-token experts is the cheapest possible
-intervention and isolates the stale-momentum and weight-decay pathology, which may account
-for most of what the smarter rules appear to buy.
+The `imb-adamw` cell OOMs at the default batch — lower batch size or enable gradient
+checkpointing before rerunning it. wandb project: `lord-of-the-strings/moe-expert-imbalance`
+(the crashed and re-run `aneg0.5` share a name — filter on run state).
 
 ## State of this work
 
+Docs: **`RESULTS.md`** (batch-1 analysis, monitoring playbook, ranked next steps) is the
+current source of truth; **`TRAINING_STACK.md`** is a walkthrough of the optimizer/stats code
+whose Muon step-size claims (its §2, §7, §8) are corrected by `RESULTS.md` §9. Both are
+untracked in git.
+
+- Batch 1 ran 2026-09-29. Headlines (n=1 seed): `--aux-loss-coef 0` gives gini 0.73 / 16%
+  dead experts; `alpha=0.5` matches the aux-loss baseline on lm_loss *and* roughly halves
+  imbalance; `alpha=-0.5` is clearly harmful; `--freeze-dead-experts` is a null result.
+- Gaps: `imb-adamw` crashed (OOM), `imb-mid-a0` (aux 0.001) never launched, no seeds.
+- The per-expert JSONLs (`checkpoints/<run_name>/<run_name>_expert_stats.jsonl`) are still on
+  the cluster (see [Cluster access](#cluster-access)); there is **no analysis script in the
+  repo** — `RESULTS.md` was built from the wandb API (snippet at its end).
 - `test_expert_stats.py` covers the statistics and LR-rule logic on CPU (36 checks; needs only
   torch, no GPU and no transformers).
-- **Nothing here has run on a GPU yet.** The unverified assumption is that HF 5.9's routers
-  return `(logits, scores, indices)`; `ExpertLoadTracker` falls back to an explicit top-k if
-  not. Validate with a short run and check that `sum(counts)` per layer per step equals
-  `batch × accum × seq_len × top_k` exactly — and that it does **not** double with gradient
-  checkpointing on.
-- There is **no analysis script yet**. The deliverable — the correlation between token share
-  and expert drift as a function of training step — has to be computed from the JSONL.
 
 ## Gotchas
 

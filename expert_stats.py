@@ -92,6 +92,11 @@ class ExpertLoadTracker:
         self._token_totals = {} # layer_idx -> int, tokens seen (for the mean)
         self._handles = []
         self._n_experts = {}    # layer_idx -> E
+        # Per-micro-batch copies (rank-local, before accumulation). One entry per
+        # arm()/disarm() cycle, i.e. per forward. Cheap: [n_micro x L x E] ints.
+        self.record_microbatches = True
+        self._mb_current = {}   # layer_idx -> LongTensor[E], the forward in flight
+        self._mb_list = []      # list of {layer_idx: LongTensor[E]}, one per micro-batch
 
         layers = find_layers(model)
         self.n_layers = 0
@@ -114,6 +119,11 @@ class ExpertLoadTracker:
             if indices is None:
                 return
             counts = torch.bincount(indices.flatten(), minlength=n_experts)
+            if self.record_microbatches:
+                # clone: synchronize() all-reduces _counts in place, and with
+                # grad_accum=1 _counts would otherwise alias this record.
+                prev_mb = self._mb_current.get(layer_idx)
+                self._mb_current[layer_idx] = counts.clone() if prev_mb is None else prev_mb + counts
             prev = self._counts.get(layer_idx)
             self._counts[layer_idx] = counts if prev is None else prev + counts
             self._n_experts[layer_idx] = n_experts
@@ -177,11 +187,70 @@ class ExpertLoadTracker:
 
     def disarm(self):
         self._armed = False
+        if self._mb_current:
+            self._mb_list.append(self._mb_current)
+            self._mb_current = {}
 
     def reset(self):
         self._counts = {}
         self._logit_sums = {}
         self._token_totals = {}
+        self._mb_current = {}
+        self._mb_list = []
+
+    # -- per-micro-batch counts ----------------------------------------
+
+    def microbatch_counts(self, gather: bool = True):
+        """This step's per-micro-batch counts as a LongTensor [R, M, L, E] on CPU.
+
+        R = DDP ranks (1 without DDP), M = micro-batches per rank, L = MoE layers
+        in ``layer_ids()`` order. These are rank-local, pre-accumulation counts:
+        the granularity at which an expert-parallel all-to-all actually waits.
+        With ``gather=True`` this is a collective: every rank must call it.
+        """
+        if not self._mb_list:
+            return None
+        lids = self.layer_ids()
+        local = torch.stack([torch.stack([mb[li] for li in lids]) for mb in self._mb_list])  # [M, L, E]
+        if gather and dist.is_available() and dist.is_initialized():
+            buf = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+            dist.all_gather(buf, local.contiguous())
+            return torch.stack(buf).cpu()
+        return local.unsqueeze(0).cpu()
+
+    def layer_ids(self):
+        return sorted(self._counts) if self._counts else sorted(self._mb_list[0]) if self._mb_list else []
+
+    def microbatch_metrics(self) -> dict:
+        """Live micro-batch vs global-batch imbalance, from this rank's micro-batches.
+
+        ``load/mb/*`` are averaged over this rank's micro-batches and over layers;
+        compare them with the global-batch ``load/gini`` and ``load/max_over_mean``.
+        No collective: one rank's micro-batches are representative micro-batches.
+        """
+        mb = self.microbatch_counts(gather=False)
+        if mb is None:
+            return {}
+        mb = mb[0].float()                                    # [M, L, E]
+        mean = mb.mean(dim=-1).clamp_min(1e-9)
+        max_over_mean = mb.max(dim=-1).values / mean          # [M, L]
+        ginis = torch.tensor([[gini(mb[m, l]) for l in range(mb.size(1))]
+                              for m in range(mb.size(0))])    # [M, L]
+        dead = (mb == 0).float().mean(dim=-1)                 # [M, L]
+        ginis_alive = torch.tensor([[gini(mb[m, l][mb[m, l] > 0]) if int((mb[m, l] > 0).sum()) > 1 else 0.0
+                                     for l in range(mb.size(1))]
+                                    for m in range(mb.size(0))])  # [M, L]
+        out = {
+            "load/mb/gini": float(ginis.mean()),
+            "load/mb/max_over_mean": float(max_over_mean.mean()),
+            "load/mb/max_over_mean_worst": float(max_over_mean.max()),
+            "load/mb/dead_expert_fraction": float(dead.mean()),
+            "load/mb/gini_alive": float(ginis_alive.mean()),
+        }
+        for l, li in enumerate(self.layer_ids()):
+            out[f"load/mb_gini/layer_{li:02d}"] = float(ginis[:, l].mean())
+            out[f"load/mb_max_over_mean/layer_{li:02d}"] = float(max_over_mean[:, l].mean())
+        return out
 
     def synchronize(self):
         """Sum counts across DDP ranks so every rank sees the global batch."""
@@ -238,7 +307,8 @@ class ExpertLoadTracker:
         """Aggregate imbalance metrics over layers, from exact global counts."""
         if not self._counts:
             return {}
-        ginis, entropies, deads, maxshares = [], [], [], []
+        ginis, entropies, deads, maxshares, mom, ginis_alive = [], [], [], [], [], []
+        per_layer = {}
         for li in sorted(self._counts):
             c = self._counts[li].float()
             total = c.sum()
@@ -251,6 +321,16 @@ class ExpertLoadTracker:
             entropies.append(float(-(nz * nz.log()).sum().item() / math.log(E)) if E > 1 else 0.0)
             deads.append(float((c == 0).sum().item()) / E)
             maxshares.append(float(p.max().item()))
+            mom.append(float((c.max() / c.mean()).item()))
+            # Gini over experts that got >=1 token. Exact split for zero-count
+            # dead experts: gini = dead_fraction + (1 - dead_fraction) * gini_alive,
+            # so this isolates inequality among active experts from deadness.
+            alive = c[c > 0]
+            ginis_alive.append(gini(alive) if alive.numel() > 1 else 0.0)
+            per_layer[f"load/gini/layer_{li:02d}"] = ginis[-1]
+            per_layer[f"load/gini_alive/layer_{li:02d}"] = ginis_alive[-1]
+            per_layer[f"load/dead_fraction/layer_{li:02d}"] = deads[-1]
+            per_layer[f"load/max_over_mean/layer_{li:02d}"] = mom[-1]
         if not ginis:
             return {}
         n = len(ginis)
@@ -259,8 +339,12 @@ class ExpertLoadTracker:
             "load/normalized_entropy": sum(entropies) / n,
             "load/dead_expert_fraction": sum(deads) / n,
             "load/max_expert_fraction": sum(maxshares) / n,
+            "load/gini_alive": sum(ginis_alive) / n,
             "load/gini_max_layer": max(ginis),
             "load/dead_fraction_max_layer": max(deads),
+            # max/mean tokens per expert: the straggler-relevant ratio (1.0 = balanced)
+            "load/max_over_mean": sum(mom) / n,
+            **per_layer,
         }
 
 

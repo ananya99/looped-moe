@@ -29,16 +29,26 @@
 # micro-batch by micro-batch costs more than restarting from scratch.
 # ===================================================================
 
+# unused flags: --no-gradient-checkpointing 
 COMMON="--arch deepseek --scale tiny --optimizer muon --z-loss-coef 1e-4 \
---batch-size 16 --grad-accum 16 --no-gradient-checkpointing --n-steps 2000 \
---run-group expert-imbalance"
+--batch-size 16 --grad-accum 16 --n-steps 2000 --no-gradient-checkpointing\
+--run-group expert-imbalance --freeze-dead-experts"
+
+csub_path="/Users/ananyagupta/repos/getting-started/csub.py"
+
+# One tag per submission, computed once so every job in this batch shares it.
+# It goes into the cluster job name, the log file, and (via --tag) the run name,
+# so checkpoints, JSONLs, wandb names and logs never collide with earlier batches.
+# Override to reuse a tag, e.g.  BATCH=b1006-0930 bash submit_imbalance_runs.sh
+BATCH="${BATCH:-b$(date +%m%d-%H%M)}"
+echo "Submitting batch $BATCH"
 
 submit () {   # submit <job-name> <extra flags...>
-    local name="$1"; shift
-    python3 csub.py -n "$name" -g 1 --node-type h200 --train -t 2h \
+    local name="$1-$BATCH"; shift
+    python3 "$csub_path" -n "$name" -g 1 --node-type h200 --train -t 16h \
         --command "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
 source looped-moe/.venv/bin/activate && cd looped-moe && mkdir -p logs && \
-python imbalance_train.py $COMMON $* 2>&1 | tee -a logs/$name.log"
+python imbalance_train.py $COMMON --tag $BATCH $* 2>&1 | tee -a logs/$name.log"
 }
 
 # ===================================================================
@@ -52,7 +62,7 @@ submit imb-bal-a0 --aux-loss-coef 0.01
 submit imb-none-a0 --aux-loss-coef 0
 
 # A.2  Intermediate strength, to check the effect is monotone in the coefficient.
-submit imb-mid-a0 --aux-loss-coef 0.001
+# submit imb-mid-a0 --aux-loss-coef 0.001
 
 # ===================================================================
 # SECTION B — per-expert learning-rate interventions (imbalanced regime)
@@ -62,18 +72,18 @@ submit imb-mid-a0 --aux-loss-coef 0.001
 #      takes a full-magnitude Muon step from a stale momentum buffer and is
 #      shrunk by weight decay every step, and that alone may account for most
 #      of whatever the smarter rules buy.
-submit imb-freeze --aux-loss-coef 0 --freeze-dead-experts
+# submit imb-freeze --aux-loss-coef 0 --freeze-dead-experts
 
 # B.1  lr_e proportional to sqrt(token share).
 submit imb-a05 --aux-loss-coef 0 --per-expert-lr-alpha 0.5
 
 # B.2  Fully token-proportional. Roughly restores the scaling that
 #      Newton-Schulz normalisation removes.
-submit imb-a1 --aux-loss-coef 0 --per-expert-lr-alpha 1.0
+# submit imb-a1 --aux-loss-coef 0 --per-expert-lr-alpha 1.0
 
 # B.3  Opposite sign: compensate cold experts upward. The correct sign is not
 #      obvious a priori, which is the point of running it.
-submit imb-aneg05 --aux-loss-coef 0 --per-expert-lr-alpha -0.5
+# submit imb-aneg05 --aux-loss-coef 0 --per-expert-lr-alpha -0.5
 
 # ===================================================================
 # SECTION C — controls
@@ -82,4 +92,4 @@ submit imb-aneg05 --aux-loss-coef 0 --per-expert-lr-alpha -0.5
 # C.0  Does the picture survive a different normaliser? AdamW keeps the expert
 #      weights as single 3D tensors, so per-expert LR is not available there —
 #      this run is measurement-only by construction.
-submit imb-adamw --aux-loss-coef 0 --optimizer adamw
+# submit imb-adamw --aux-loss-coef 0 --optimizer adamw

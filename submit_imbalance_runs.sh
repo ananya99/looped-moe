@@ -31,8 +31,10 @@
 
 # unused flags: --no-gradient-checkpointing 
 COMMON="--arch deepseek --scale tiny --optimizer muon --z-loss-coef 1e-4 \
---batch-size 16 --grad-accum 16 --n-steps 2000 --no-gradient-checkpointing\
---run-group expert-imbalance --freeze-dead-experts"
+--batch-size 16 --grad-accum 16 --n-steps 2000 --no-gradient-checkpointing \
+--freeze-dead-experts"
+# wandb group defaults to the condition (run name minus the batch tag), so seeds
+# and batches of the same condition group together. Don't pass --run-group here.
 
 csub_path="/Users/ananyagupta/repos/getting-started/csub.py"
 
@@ -43,12 +45,15 @@ csub_path="/Users/ananyagupta/repos/getting-started/csub.py"
 BATCH="${BATCH:-b$(date +%m%d-%H%M)}"
 echo "Submitting batch $BATCH"
 
-submit () {   # submit <job-name> <extra flags...>
+submit () {   # [NOTES="purpose"] submit <job-name> <extra flags...>
     local name="$1-$BATCH"; shift
+    # %q-quote the notes so spaces/quotes survive the remote shell.
+    local notes_flag=""
+    [ -n "$NOTES" ] && notes_flag="--wandb-notes $(printf %q "$NOTES")"
     python3 "$csub_path" -n "$name" -g 1 --node-type h200 --train -t 16h \
         --command "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True && \
 source looped-moe/.venv/bin/activate && cd looped-moe && mkdir -p logs && \
-python imbalance_train.py $COMMON --tag $BATCH $* 2>&1 | tee -a logs/$name.log"
+python imbalance_train.py $COMMON --tag $BATCH $notes_flag $* 2>&1 | tee -a logs/$name.log"
 }
 
 # ===================================================================

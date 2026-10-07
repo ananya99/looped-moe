@@ -7,3 +7,4 @@ numpy
 tqdm
 lm-eval    # must pull newest directly from    uv pip install git+https://github.com/EleutherAI/lm-evaluation-harness.git
 hydra-core>=1.3
+pytest            # tests/ (moestack)

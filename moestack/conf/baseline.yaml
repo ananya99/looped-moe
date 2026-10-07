@@ -1,0 +1,57 @@
+# Baseline MoE pretraining (moestack). Defaults reproduce imbalance_train.py's
+# baseline cell (deepseek-tiny, Muon, aux 0.01, z 1e-4) -- see moestack/README.md.
+# Override anything on the CLI:  python -m moestack.train loss.aux_coef=0 train.seed=1
+
+model:
+  arch: deepseek          # deepseek | olmoe | qwen3moe
+  scale: tiny             # tiny | small | regular (width only; depth fixed per arch)
+  experts_impl: grouped_mm
+
+loss:
+  aux_coef: 0.01          # load balancing; 0 = no balancing pressure
+  z_coef: 1.0e-4          # router z-loss
+
+optim:
+  name: muon              # muon (Muon for matrices + AdamW for the rest) | adamw
+  lr: 0.02
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  grad_clip: 1.0
+
+parallel:
+  dp: -1                  # -1 = all ranks
+  ep: 1                   # >1 not implemented yet (fails loudly)
+  tp: 1
+  compile: false
+  activation_checkpointing: false
+  mixed_precision: bf16
+
+data:
+  source: stream          # stream | synthetic
+  seq_len: 2048
+  batch_size: 16          # per rank
+  grad_accum: 16
+  num_workers: 4
+  eval_batches: 10
+
+train:
+  n_steps: 2000
+  seed: 42
+  log_every: 10
+  eval_every: 500
+  save_every: 500
+  save_dir: checkpoints
+  auto_resume: false
+  dry_run: false
+
+logging:
+  wandb: true
+  project: moe-baseline
+  tag: null
+  load_stats: true
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${train.save_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}

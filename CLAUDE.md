@@ -30,6 +30,26 @@ pipeline, not a wrapper around it. When a request mentions "the model", ask whic
 have separate config systems, separate `build_optimizer` implementations, and separate
 LR-scaling flags.
 
+## `moestack/` — modular baseline stack (branch `refactor/baseline`)
+
+A fourth, independent stack: the *baseline* path of `imbalance_train.py` (untied, no
+per-expert LR) refactored into modules — own OLMoE/Qwen3-style model with
+`Router` / `Dispatcher` / `GroupedExperts` seams, rule-based optimizer construction with a
+batched 3D Muon (no 2D proxies), callbacks, full-state checkpoints, DDP with mesh seams
+for FSDP/EP. It imports only the repo-root `data.py`; the old scripts are untouched.
+`moestack/README.md` is the source of truth (layout, parity guarantees, intentional
+differences from the original, where FSDP/EP/experiments plug in).
+
+```bash
+python -m moestack.train loss.aux_coef=0 train.seed=1          # Hydra, conf: moestack/conf/baseline.yaml
+python -m moestack.train data.source=synthetic train.dry_run=true logging.wandb=false
+torchrun --standalone --nproc_per_node=4 -m moestack.train
+python -m pytest tests -q                                       # 38 CPU tests incl. HF parity, 2-proc DDP
+```
+
+Do not put experiment logic in `moestack/trainer.py`: new ideas are optimizer `Rule`s,
+param-group attributes or callbacks.
+
 ## Commands
 
 ```bash

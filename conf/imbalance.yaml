@@ -1,0 +1,67 @@
+# Default config for imbalance_train.py (Hydra).
+#
+# Edit values here, or override any field on the command line:
+#   python imbalance_train.py aux_loss_coef=0 per_expert_lr_alpha=0.5 seed=1
+#   python imbalance_train.py --cfg job        # print the composed config and exit
+#
+# Field names match the code (args.<name>), so the training script is unchanged.
+# null means "use the per-arch default in TRAIN_CONFIGS" where noted.
+
+# --- Model -----------------------------------------------------------------
+arch: deepseek          # deepseek | olmoe | qwen3moe
+scale: tiny             # regular | small | tiny  (width only; depth fixed per arch)
+
+# --- Training --------------------------------------------------------------
+optimizer: muon         # muon | adamw  (per-expert LR needs muon)
+lr: null                # null = per-arch default
+n_steps: 2000           # null = per-arch default
+batch_size: 16          # micro-batch size, per GPU
+grad_accum: 16          # micro-batches per optimizer step
+seq_len: null           # null = per-arch default (2048)
+dry_run: false          # true = 100 steps
+seed: 42
+
+# --- Router losses -----------------------------------------------------------
+aux_loss_coef: 0.01     # load-balancing strength; 0 = the imbalanced regime
+z_loss_coef: 1.0e-4     # router z-loss; independent of aux_loss_coef
+
+# --- Per-expert learning rate ---------------------------------------------------
+per_expert_lr_alpha: 0.0      # lr_e ∝ share_e**alpha; 0 = uniform, 1 = token-proportional
+freeze_dead_experts: false    # lr = 0 for experts with zero tokens this step
+per_expert_lr_normalize: true # rescale multipliers to mean 1.0 over alive experts
+per_expert_lr_clamp_max: 10.0 # ceiling on the multiplier (floor is 1e-3)
+expert_count_ema: 0.9         # EMA decay of counts driving the rule; 0 = raw counts
+
+# --- Measurement ---------------------------------------------------------------
+expert_tracking: true
+expert_stats_every: 10            # wandb load/* cadence
+expert_stats_dense_until: 500     # ... but every step until here
+expert_stats_full_every: 50       # per-expert JSONL cadence; 0 disables
+microbatch_stats_every: 25        # per-micro-batch counts JSONL cadence; 0 disables
+microbatch_stats_dense_until: 50  # ... but every step until here
+track_expert_drift: false         # also track ||w - w_init|| (bf16 copy on device)
+
+# --- System ----------------------------------------------------------------------
+device: null
+save_dir: checkpoints
+gradient_checkpointing: false
+resume: null
+auto_resume: false
+
+# --- Run identity & wandb (see run_tracking.py) -----------------------------------
+tag: null               # suffix for run name; submit script sets the batch tag
+no_wandb: false
+wandb_project: moe-expert-imbalance
+run_group: null         # null = condition name (run name minus tag)
+wandb_tags: null        # list, e.g. CLI: wandb_tags=[short,mb-metrics]
+wandb_notes: null       # one-line purpose of the run
+wandb_job_type: null    # null = baseline / intervention / control, inferred
+
+# --- Hydra ---------------------------------------------------------------------------
+# Stay in the launch directory (relative paths like checkpoints/ keep working) and
+# keep Hydra's per-run record (composed config + overrides) under save_dir.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${save_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}

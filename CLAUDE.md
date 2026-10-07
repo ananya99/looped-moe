@@ -21,7 +21,7 @@ experts. It means `layers[i].mlp.experts.gate_up_proj is layers[j].mlp.experts.g
 |---|---|---|
 | **Section 3 ablation** | `train.py` + `model.py` | Hand-written depth-32 transformer with *looped* topologies. Small-scale component ablation (which components can be tied). Not a production MoE. |
 | **Section 4 main** | `moe_train.py` | Real MoE training on HuggingFace `transformers` reference models (`OlmoeForCausalLM`, `Qwen3MoeForCausalLM`). This is where the paper's headline results come from. |
-| **Expert-imbalance experiment** | `imbalance_train.py` + `expert_stats.py` | The `moe_train.py` pipeline with the tying machinery stripped out, plus per-expert token measurement and per-expert learning rates. |
+| **Expert-imbalance experiment** | `imbalance_train.py` + `expert_stats.py` + `run_tracking.py` | The `moe_train.py` pipeline with the tying machinery stripped out, plus per-expert token measurement and per-expert learning rates. |
 | Eval | `eval_downstream.py` | lm-eval-harness wrapper; reads checkpoints from either MoE trainer. |
 
 `model.py` is imported only by `train.py`. `moe_train.py` never touches it, and
@@ -42,9 +42,10 @@ python moe_train.py --arch olmoe --scale tiny --tie-group-size 4 --optimizer muo
 torchrun --standalone --nproc_per_node=4 moe_train.py --arch qwen3moe --tie-group-size 4 ...
 
 # --- Expert-imbalance experiment (imbalance_train.py) ---
-python imbalance_train.py --arch deepseek --scale tiny --aux-loss-coef 0 --n-steps 2000
-python imbalance_train.py --arch deepseek --scale tiny --aux-loss-coef 0 \
-    --per-expert-lr-alpha 1.0 --freeze-dead-experts
+# Hydra: defaults in conf/imbalance.yaml, override with key=value (no -- flags)
+python imbalance_train.py aux_loss_coef=0 n_steps=2000
+python imbalance_train.py aux_loss_coef=0 per_expert_lr_alpha=1.0 freeze_dead_experts=true
+python imbalance_train.py --cfg job        # print the composed config
 bash submit_imbalance_runs.sh              # the 8-run matrix (cluster only)
 python test_expert_stats.py                # CPU tests for the measurement logic
 
@@ -230,6 +231,25 @@ Two deliberate differences from `moe_train.py`:
 at a fixed non-zero carrier and each term inside `f` is pre-divided by it. That makes
 `--aux-loss-coef` and `--z-loss-coef` independent, which is what allows load balancing to be
 switched off (`--aux-loss-coef 0`, the imbalanced regime) while the router z-loss stays on.
+
+## Config: `conf/imbalance.yaml` (Hydra)
+
+`imbalance_train.py` takes no argparse flags: every option is a field in
+`conf/imbalance.yaml` (same names as `args.<name>` in the code), overridable as
+`key=value`. `main()` converts the composed config to an `argparse.Namespace`, so
+the training code is unchanged. Hydra does not chdir; its record of each run
+(composed config + overrides) goes to `<save_dir>/hydra/<timestamp>/.hydra/`, and a
+copy named `<run_name>_config.yaml` sits next to the checkpoints. A comma in a
+value must be quoted or written as a list (`wandb_tags=[a,b]`), or Hydra reads it
+as a sweep. `moe_train.py` and `train.py` still use argparse flags.
+
+## `run_tracking.py`
+
+Run identity and wandb setup, kept out of the training script: `build_run_name`
+(unique name incl. `--tag`), `build_condition_name` (name minus tag = wandb group, so
+seeds/batches of a condition group together), inferred `job_type`
+(baseline/intervention/control), git commit + dirty flag, the `--wandb-*` CLI flags,
+and `init_wandb()`.
 
 ## `expert_stats.py`
 

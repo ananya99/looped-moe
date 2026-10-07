@@ -1,5 +1,8 @@
 """Run identity and experiment tracking for imbalance_train.py.
 
+The wandb fields (wandb_project, run_group, wandb_tags, wandb_notes,
+wandb_job_type) are set in conf/imbalance.yaml or as CLI overrides.
+
 Everything that names, groups and labels a run lives here, so the training
 script only contains the experiment itself:
 
@@ -9,7 +12,6 @@ script only contains the experiment itself:
                         group together
   default_job_type      baseline / intervention / control, inferred from flags
   git_state             (commit, dirty) of the running code
-  add_tracking_args     the wandb CLI flags
   init_wandb            assembles group, tags, notes and config, then wandb.init
 """
 from __future__ import annotations
@@ -92,21 +94,6 @@ def build_run_name(args):
 # ──────────────────────────────────────────────────────────────────────
 
 
-def add_tracking_args(p):
-    """Register the wandb-related CLI flags on an argparse parser."""
-    p.add_argument("--wandb-project", default="moe-expert-imbalance")
-    p.add_argument("--run-group", default=None,
-                   help="wandb group; default = the condition name (run name minus "
-                        "--tag), so seeds/batches of one condition group together")
-    p.add_argument("--wandb-tags", default=None,
-                   help="Comma-separated extra wandb tags; batch:<tag> and "
-                        "steps:<n> are added automatically")
-    p.add_argument("--wandb-notes", default=None,
-                   help="One-line purpose of the run, shown in wandb")
-    p.add_argument("--wandb-job-type", default=None,
-                   help="Default: baseline / intervention / control, inferred from flags")
-
-
 def init_wandb(args, run_name: str, n_steps: int, config: dict, resume_id=None):
     """Start (or resume) the wandb run with full identity metadata.
 
@@ -119,7 +106,10 @@ def init_wandb(args, run_name: str, n_steps: int, config: dict, resume_id=None):
     condition = build_condition_name(args)
     git_sha, git_dirty = git_state()
 
-    tags = [t.strip() for t in (args.wandb_tags or "").split(",") if t.strip()]
+    raw = args.wandb_tags or []
+    if isinstance(raw, str):          # "a,b" (quoted on the CLI) or a single tag
+        raw = raw.split(",")
+    tags = [str(t).strip() for t in raw if str(t).strip()]
     if args.tag:
         tags.append(f"batch:{args.tag}")
     tags.append(f"steps:{n_steps}")

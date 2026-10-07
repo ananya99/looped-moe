@@ -55,8 +55,11 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
+
 from data import get_dataloader, get_eval_batches
-from run_tracking import add_tracking_args, build_run_name, init_wandb
+from run_tracking import build_run_name, init_wandb
 from expert_stats import (
     ExpertLoadTracker,
     ExpertStatsWriter,
@@ -1019,84 +1022,35 @@ def save_checkpoint(path, model, optimizer, step, best_eval_loss, args, config, 
 # 7. CLI
 # ──────────────────────────────────────────────────────────────────────
 
-def main():
-    p = argparse.ArgumentParser(
-        description="Baseline MoE pretraining + per-expert LR experiment",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+@hydra.main(version_base=None, config_path="conf", config_name="imbalance")
+def main(cfg: DictConfig):
+    """Entry point. Config: conf/imbalance.yaml, overridable as key=value on the CLI.
 
-    p.add_argument("--arch", default="deepseek", choices=list(ARCH_REGISTRY.keys()))
-    p.add_argument("--scale", default="regular", choices=["regular", "small", "tiny"],
-                   help="Width only; layer counts are fixed per arch")
-    p.add_argument("--tag", default=None, help="Extra suffix for the run name")
+    The composed config is turned into a plain Namespace so the rest of the file
+    keeps using args.<name> exactly as with the former argparse interface.
+    """
+    args = argparse.Namespace(**OmegaConf.to_container(cfg, resolve=True))
 
-    # Training
-    p.add_argument("--n-steps", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--grad-accum", type=int, default=None)
-    p.add_argument("--seq-len", type=int, default=None)
-    p.add_argument("--dry-run", action="store_true", help="100 steps")
-    p.add_argument("--optimizer", default="muon", choices=["adamw", "muon"])
-    p.add_argument("--lr", type=float, default=None)
+    if args.arch not in ARCH_REGISTRY:
+        raise SystemExit(f"arch must be one of {list(ARCH_REGISTRY)}, got {args.arch!r}")
+    if args.scale not in ("regular", "small", "tiny"):
+        raise SystemExit(f"scale must be regular | small | tiny, got {args.scale!r}")
+    if args.optimizer not in ("adamw", "muon"):
+        raise SystemExit(f"optimizer must be adamw | muon, got {args.optimizer!r}")
 
-    # Router losses
-    p.add_argument("--aux-loss-coef", type=float, default=0.01,
-                   help="Load-balancing strength. 0 disables it, which is the "
-                        "imbalanced regime this experiment studies")
-    p.add_argument("--z-loss-coef", type=float, default=1e-4,
-                   help="Router z-loss; independent of --aux-loss-coef")
-
-    # Per-expert learning rate
-    p.add_argument("--per-expert-lr-alpha", type=float, default=0.0,
-                   help="lr_e proportional to s_e**alpha, s_e = token share. "
-                        "0 = uniform, 1 = token-proportional, negative = boost cold experts")
-    p.add_argument("--freeze-dead-experts", action="store_true",
-                   help="lr = 0 for experts with no tokens this step, which also "
-                        "suppresses their weight decay and stale-momentum step")
-    p.add_argument("--no-per-expert-lr-normalize", dest="per_expert_lr_normalize",
-                   action="store_false", default=True,
-                   help="Do not rescale multipliers to average 1.0 over alive experts")
-    p.add_argument("--per-expert-lr-clamp-max", type=float, default=10.0,
-                   help="Ceiling on the multiplier; floor is 1e-3")
-    p.add_argument("--expert-count-ema", type=float, default=0.9,
-                   help="EMA decay for the counts driving the rule; 0 = raw per-step counts")
-
-    # Measurement
-    p.add_argument("--no-expert-tracking", dest="expert_tracking",
-                   action="store_false", default=True)
-    p.add_argument("--expert-stats-every", type=int, default=10)
-    p.add_argument("--expert-stats-dense-until", type=int, default=500,
-                   help="Log every step until here; imbalance is largest early")
-    p.add_argument("--expert-stats-full-every", type=int, default=50,
-                   help="Per-expert JSONL dump cadence; 0 disables")
-    p.add_argument("--microbatch-stats-every", type=int, default=25,
-                   help="Per-micro-batch, per-rank count dump cadence (JSONL); 0 disables")
-    p.add_argument("--microbatch-stats-dense-until", type=int, default=50,
-                   help="Dump micro-batch counts every step until here (collapse phase)")
-    p.add_argument("--track-expert-drift", action="store_true",
-                   help="Also track ||w - w_init|| (keeps a bf16 copy on device)")
-
-    # System
-    p.add_argument("--device", default=None)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--save-dir", default="checkpoints")
-    p.add_argument("--gradient-checkpointing", action="store_true", default=True)
-    p.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing",
-                   action="store_false")
-    p.add_argument("--resume", default=None)
-    p.add_argument("--auto-resume", action="store_true")
-    p.add_argument("--no-wandb", action="store_true")
-    add_tracking_args(p)   # --wandb-project, --run-group, --wandb-tags/-notes/-job-type
-
-    args = p.parse_args()
+    # Keep a copy of the exact config next to the checkpoints, named like them.
+    if int(os.environ.get("RANK", "0")) == 0:
+        Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, Path(args.save_dir) / f"{build_run_name(args)}_config.yaml")
 
     if (args.per_expert_lr_alpha != 0.0 or args.freeze_dead_experts):
         if args.optimizer != "muon":
             raise SystemExit(
-                "--per-expert-lr-alpha / --freeze-dead-experts require --optimizer muon: "
+                "per_expert_lr_alpha / freeze_dead_experts require optimizer=muon: "
                 "under AdamW the experts stay as single 3D tensors, so there is no "
                 "per-expert parameter to attach a learning rate to.")
         if not args.expert_tracking:
-            raise SystemExit("Per-expert LR needs the token counts; drop --no-expert-tracking.")
+            raise SystemExit("Per-expert LR needs the token counts; set expert_tracking=true.")
     if args.aux_loss_coef < 0 or args.z_loss_coef < 0:
         raise SystemExit("Loss coefficients must be >= 0.")
 

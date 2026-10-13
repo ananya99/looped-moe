@@ -50,9 +50,10 @@ run () {   # [GPUS=n] [NOTES=..] [RESUME=1] run <name> <overrides...>
     local gpus="${GPUS:-1}" notes="${NOTES:-}" resume="${RESUME:-0}"
     # k8s job names: lowercase alphanumerics and '-', <= 63 chars
     local job
-    job="$(echo "ms-$base-$BATCH" | tr '[:upper:]_.' '[:lower:]--' | tr -cd 'a-z0-9-' | cut -c1-63)"
+    job="$(echo "ms-$base-$BATCH" | tr '[:upper:]' '[:lower:]' | tr '_.' '--' | tr -cd 'a-z0-9-' | cut -c1-63)"
 
-    local overrides=("${COMMON[@]}" "$@" "logging.tag=$BATCH")
+    # ${arr[@]+"${arr[@]}"}: macOS's bash 3.2 treats an empty array as unbound under set -u
+    local overrides=(${COMMON[@]+"${COMMON[@]}"} ${1+"$@"} "logging.tag=$BATCH")
     [ "$resume" = 1 ] && overrides+=("train.auto_resume=true")
     [ -n "$notes" ] && overrides+=("logging.notes='$notes'")
 

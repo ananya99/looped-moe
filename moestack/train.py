@@ -16,9 +16,14 @@ import os
 from pathlib import Path
 
 import hydra
+from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig, OmegaConf
 
 from .config import Config
+
+# The dataclasses are the schema: baseline.yaml only sets values, and every field
+# in config.py (e.g. logging.notes, train.resume) is overridable from the CLI.
+ConfigStore.instance().store(name="moestack_schema", node=Config)
 
 
 def to_config(cfg: DictConfig) -> Config:

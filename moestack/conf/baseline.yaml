@@ -1,6 +1,11 @@
 # Baseline MoE pretraining (moestack). Defaults reproduce imbalance_train.py's
 # baseline cell (deepseek-tiny, Muon, aux 0.01, z 1e-4) -- see moestack/README.md.
 # Override anything on the CLI:  python -m moestack.train loss.aux_coef=0 train.seed=1
+# Every field of moestack/config.py is overridable (the dataclasses are the schema).
+
+defaults:
+  - moestack_schema
+  - _self_
 
 model:
   arch: deepseek          # deepseek | olmoe | qwen3moe

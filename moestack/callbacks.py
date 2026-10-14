@@ -131,8 +131,10 @@ class WandbLogger(Callback):
     """Logs every step's loss terms + whatever other callbacks put in state.metrics.
     Run id is checkpointed so a resumed job continues the same wandb run."""
 
-    def __init__(self, cfg, run_name: str, config_dict: dict):
+    def __init__(self, cfg, run_name: str, config_dict: dict, group: str | None = None):
         self.cfg, self.run_name, self.config_dict = cfg, run_name, config_dict
+        # An explicit logging.group wins; otherwise group by experimental condition.
+        self.group = cfg.group or group
         self.run, self.run_id = None, None
 
     def on_train_start(self, trainer):
@@ -140,7 +142,7 @@ class WandbLogger(Callback):
             return
         import wandb
         self.run = wandb.init(project=self.cfg.project, entity=self.cfg.entity, name=self.run_name,
-                              group=self.cfg.group, tags=self.cfg.tags, notes=self.cfg.notes,
+                              group=self.group, tags=self.cfg.tags, notes=self.cfg.notes,
                               config=self.config_dict, id=self.run_id,
                               resume="allow" if self.run_id else None)
         self.run_id = self.run.id

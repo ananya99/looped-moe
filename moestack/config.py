@@ -166,7 +166,7 @@ class TrainConfig:
 @dataclass
 class LoggingConfig:
     wandb: bool = True
-    project: str = "moe-baseline"
+    project: str = "moe-expert-imbalance"
     entity: Optional[str] = None
     tag: Optional[str] = None
     group: Optional[str] = None
@@ -194,14 +194,22 @@ class Config:
             if val not in allowed:
                 raise ValueError(f"{key} must be one of {allowed}, got {val!r}")
 
+    def condition_name(self) -> str:
+        """run_name() without the seed or the batch tag: one value per experimental
+        condition. Used as the wandb group, so repeated runs of a condition (other
+        seeds, other batches) land in one group and wandb plots their mean and
+        spread. Mirrors run_tracking.build_condition_name in the original stack.
+        """
+        def fmt(x):
+            return f"{x:g}"
+        return (f"{self.model.arch}-{self.model.scale}-{self.optim.name}"
+                f"-aux{fmt(self.loss.aux_coef)}-z{fmt(self.loss.z_coef)}"
+                f"-lr{fmt(self.optim.lr)}")
+
     def run_name(self) -> str:
         """Encodes every field that distinguishes a baseline cell, so two runs can
         never share checkpoint filenames by accident."""
-        def fmt(x):
-            return f"{x:g}"
-        name = (f"{self.model.arch}-{self.model.scale}-{self.optim.name}"
-                f"-aux{fmt(self.loss.aux_coef)}-z{fmt(self.loss.z_coef)}"
-                f"-lr{fmt(self.optim.lr)}-s{self.train.seed}")
+        name = f"{self.condition_name()}-s{self.train.seed}"
         if self.logging.tag:
             name += f"-{self.logging.tag}"
         return name

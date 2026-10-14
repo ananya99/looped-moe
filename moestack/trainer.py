@@ -53,7 +53,8 @@ class Trainer:
         cbs += list(callbacks or [])
         cbs.append(ConsoleLogger(cfg.train.log_every))
         if cfg.logging.wandb and d.is_main:
-            cbs.append(WandbLogger(cfg.logging, self.run_name, cfg.to_dict()))
+            cbs.append(WandbLogger(cfg.logging, self.run_name, cfg.to_dict(),
+                                   group=cfg.condition_name()))
         self.callbacks = CallbackList(cbs)
 
         self.use_amp = cfg.parallel.mixed_precision == "bf16" and d.device.type == "cuda"

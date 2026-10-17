@@ -47,5 +47,34 @@ def _deterministic():
     yield
 
 
+def _missing_torch_features():
+    """Probe for the features moestack needs, rather than parsing versions."""
+    import torch.nn.functional as F
+    missing = []
+    try:
+        q = torch.zeros(1, 2, 2, 4)
+        F.scaled_dot_product_attention(q, q[:, :1], q[:, :1], enable_gqa=True)
+    except TypeError:
+        missing.append("F.scaled_dot_product_attention(enable_gqa=...)  [torch >= 2.5]")
+    except Exception:
+        pass        # some other complaint: the kwarg exists, which is all we asked
+    if not hasattr(torch.optim, "Muon"):
+        missing.append("torch.optim.Muon  (reference for the batched-Muon tests)")
+    return missing
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: compiles with torch.compile (deselect with -m 'not slow')")
+    config.addinivalue_line("markers", "grouped_mm: needs F.grouped_mm (the fused expert GEMM)")
+    # One clear message beats sixteen tracebacks. The usual cause is running the
+    # system python instead of the project venv -- e.g. pytest in a fresh cluster
+    # pod, where /usr/local/lib/.../torch is years older than requirements.txt.
+    missing = _missing_torch_features()
+    if missing:
+        raise pytest.UsageError(
+            f"this interpreter cannot run the moestack tests.\n"
+            f"  torch {torch.__version__} from {torch.__file__}\n"
+            f"  missing: " + "\n           ".join(missing) + "\n"
+            f"requirements.txt pins torch==2.12.0 / transformers==5.9.0.\n"
+            f"On the cluster:  cd ~/looped-moe && source .venv/bin/activate && "
+            f"python -m pytest tests -q")

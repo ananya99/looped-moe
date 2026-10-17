@@ -1,13 +1,22 @@
 """MoE layer invariants: dispatch/combine, expert implementations, routing counts."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 
 from moestack.model import MoE, LocalDispatcher, GroupedExperts
+from moestack.model.moe import _grouped_mm_available
 from moestack.initialization import init_weights
 from moestack.model import Transformer
 
 from conftest import tiny_args
+
+# Without F.grouped_mm, GroupedExperts silently falls back to _forward_loop -- so a
+# "grouped_mm" test would compare the loop against the loop and pass while checking
+# nothing. Skip loudly instead of passing vacuously.
+needs_grouped_mm = pytest.mark.skipif(not _grouped_mm_available(),
+                                      reason="F.grouped_mm unavailable; the loop fallback "
+                                             "would make this test vacuous")
 
 
 def _moe(**kw):
@@ -34,14 +43,17 @@ def naive_moe(m: MoE, x):
     return out.view(B, T, D)
 
 
-def test_moe_matches_naive_definition():
-    for impl in ("grouped_mm", "loop"):
-        m, args = _moe(experts_impl=impl)
-        x = torch.randn(2, 5, args.dim)
-        y, _ = m(x)
-        torch.testing.assert_close(y, naive_moe(m, x), atol=1e-5, rtol=1e-4)
+@pytest.mark.parametrize("impl", ["grouped_mm", "loop"])
+def test_moe_matches_naive_definition(impl):
+    if impl == "grouped_mm" and not _grouped_mm_available():
+        pytest.skip("F.grouped_mm unavailable; this would re-test the loop")
+    m, args = _moe(experts_impl=impl)
+    x = torch.randn(2, 5, args.dim)
+    y, _ = m(x)
+    torch.testing.assert_close(y, naive_moe(m, x), atol=1e-5, rtol=1e-4)
 
 
+@needs_grouped_mm
 def test_grouped_mm_equals_loop_forward_and_backward():
     m, args = _moe(experts_impl="grouped_mm")
     x = torch.randn(3, 7, args.dim)

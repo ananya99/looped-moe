@@ -68,6 +68,11 @@ never overwrite each other's checkpoints.
 | Muon on experts | one 2D proxy `Parameter` per expert + grad copy every step | batched Newton–Schulz on the 3D tensor | same math per matrix (tested vs `torch.optim.Muon`, ≤1 bf16 ulp), no proxies or Python loop over experts |
 | Resume | replays the stream | replays the stream (`stream`), seeks instantly (`synthetic`); restores RNG + callback state | resume is bit-identical to an uninterrupted run (tested) |
 | Eval cadence | after step index 500, 1000, … | after 500, 1000, … completed steps | off-by-one cleanup |
+| LM loss memory | one-shot `logits.float()` → ~20 GB held, ~33 GB peak at B=16/T=2048/V=100k | `loss.lm_chunk_rows` (4096) chunks it, each chunk's fp32 cast and log-softmax recomputed in backward | same value and gradient; ~10 GB peak, which is what caps batch size at this vocab |
+| Non-finite step | applied, then the run raises | dropped (`train/skipped_steps`), run aborts after `train.max_consecutive_skips` in a row | a NaN step poisons the weights *and* the next checkpoint before anything notices |
+| Eval scoring | `cross_entropy` without `ignore_index`, divided by `targets.numel()` | the same `lm_cross_entropy_sum` training uses | train and eval cannot drift on which positions count |
+| SIGTERM | killed where it lands, losing up to `save_every` steps | checkpoints at the next step boundary and exits; a second signal kills immediately | `submit_moestack_runs.sh` caps each job with `timeout`, so this is the normal way a long run ends |
+| Run name | a curated list of flags; changing batch size, grad accum, seq len or n_steps silently reused another run's checkpoints | `condition_name()` carries a fingerprint of **every** learning-relevant field that differs from the defaults | new options are part of a run's identity by default and must be excluded on purpose |
 
 Checkpoints are `moestack-v1` files (not HF state dicts). For `eval_downstream.py`, convert with
 `hf_compat.to_hf_model(model, arch).save_pretrained(path)`.

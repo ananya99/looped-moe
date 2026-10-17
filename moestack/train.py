@@ -12,7 +12,6 @@ unknown key is an error rather than a silent no-op.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import hydra
@@ -35,11 +34,13 @@ def to_config(cfg: DictConfig) -> Config:
 def main(cfg: DictConfig):
     from .trainer import Trainer
     config = to_config(cfg)
-    if int(os.environ.get("RANK", "0")) == 0:
-        Path(config.train.save_dir).mkdir(parents=True, exist_ok=True)
-        OmegaConf.save(OmegaConf.structured(config),
-                       Path(config.train.save_dir) / f"{config.run_name()}_config.yaml")
+    # Built first: the Trainer normalises the config (dry_run) and owns the run
+    # name, so saving the yaml from here cannot disagree with the checkpoints.
     trainer = Trainer(config)
+    if trainer.dist.is_main:
+        save_dir = Path(config.train.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(OmegaConf.structured(config), save_dir / f"{trainer.run_name}_config.yaml")
     try:
         trainer.fit()
     finally:

@@ -3,12 +3,18 @@
 # Submit moestack runs to the MLO RunAI cluster (via csub.py)
 # ===================================================================
 #
-#   bash submit_moestack_runs.sh                      # submit EVERY run below (16 jobs!)
+#   bash submit_moestack_runs.sh                      # submit EVERY run below (17 jobs!)
 #   bash submit_moestack_runs.sh parity               # submit just this one (exact name, no regex)
-#   DRY=1 bash submit_moestack_runs.sh | grep '>>'    # preview what would be submitted
-#   BATCH=b1013-0930 bash ... aux0-s0                 # reuse a batch tag (e.g. to resume)
+#   bash submit_moestack_runs.sh --dry | grep '>>'    # print the commands, submit nothing
+#   bash submit_moestack_runs.sh --trial parity       # submit it, but 100 steps, tagged "trial"
+#   bash submit_moestack_runs.sh --batch b1013-0930 aux0-s0   # reuse a batch tag (to resume)
 #
-# Env knobs: NODE_TYPE (h200)  BACKOFF (4)  TIME (16h)  DRY (0)  BATCH (b<MMDD-HHMM>).
+# --trial appends train.n_steps=$TRIAL_STEPS and logging.tags=[trial]; Hydra's last value wins,
+# so it overrides whatever the run line asked for. Use it to smoke-test a cell before
+# committing hours to it, and filter the wandb tag "trial" out of real results.
+#
+# Env knobs: NODE_TYPE (h200)  BACKOFF (4)  TIME (16h)  BATCH (b<MMDD-HHMM>); BATCH
+# also takes a flag, and the flag wins over the env var.
 # Paths to csub.py / the repo / the venv are hardcoded just below -- edit them there.
 #
 # Each run is one line:  [GPUS=n] [NOTES=".."] [RESUME=1] [TIME=..] run <name> <hydra overrides...>
@@ -52,9 +58,24 @@ VENV=.venv                                   # relative to REPO_DIR
 NODE_TYPE="${NODE_TYPE:-h200}"
 BACKOFF="${BACKOFF:-4}"                      # runai retries before a job is marked Failed
 TIME="${TIME:-16h}"
-DRY="${DRY:-0}"
+DRY="${DRY:-0}"                              # or pass --dry
+TRIAL=0                                      # 1 once --trial is passed
+TRIAL_STEPS=100                              # what --trial shortens every run to
 BATCH="${BATCH:-b$(date +%m%d-%H%M)}"
 
+while [ $# -gt 0 ]; do                       # flags first, then an optional run name
+    case "$1" in
+        --dry|-n)  DRY=1;   shift ;;
+        --trial)   TRIAL=1; shift ;;
+        --batch)   shift; BATCH="${1:-}"; shift || true
+                   [ -n "$BATCH" ] || { echo "--batch needs a tag, e.g. --batch b1013-0930" >&2; exit 1; } ;;
+        --batch=*) BATCH="${1#--batch=}"; shift
+                   [ -n "$BATCH" ] || { echo "--batch needs a tag, e.g. --batch=b1013-0930" >&2; exit 1; } ;;
+        -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
+        -*)        echo "unknown flag: $1 (try --help)" >&2; exit 1 ;;
+        *)         break ;;
+    esac
+done
 ONLY="${1:-}"                                # exact run name; empty submits every run
 # Hydra overrides applied to every run in this file.
 COMMON=()
@@ -91,6 +112,8 @@ run () {   # [GPUS=n] [NOTES=..] [RESUME=1] run <name> <overrides...>
     local overrides=(${COMMON[@]+"${COMMON[@]}"} ${1+"$@"} "logging.tag=$BATCH")
     [ "$resume" = 1 ] && overrides+=("train.auto_resume=true")
     [ -n "$notes" ] && overrides+=("logging.notes='$notes'")
+    # Appended last so Hydra's last-value-wins overrides the run line's own n_steps.
+    [ "$TRIAL" = 1 ] && overrides+=("train.n_steps=$TRIAL_STEPS" "logging.tags=[trial]")
 
     if [ -n "$ONLY" ] && [ "$ONLY" != "$base" ]; then
         return
@@ -121,7 +144,9 @@ exit \$rc"
     python3 "$CSUB" "${flags[@]}" --command "$cmd"
 }
 
-echo "Submitting batch $BATCH  ${ONLY:+only='$ONLY'  }dry=$DRY"
+trial_note=""
+[ "$TRIAL" = 1 ] && trial_note="  trial=$TRIAL_STEPS steps"
+echo "Submitting batch $BATCH  ${ONLY:+only='$ONLY'  }dry=$DRY$trial_note"
 
 # =====================================================================================
 # A — sanity: does the refactor behave on GPU?
@@ -168,6 +193,18 @@ NOTES="qwen3moe-tiny"        run qwen3-aux0.01 model.arch=qwen3moe
 # The old imb-adamw cell OOMed at the default batch; activation checkpointing should avoid that.
 NOTES="AdamW control, imbalanced" \
 run adamw-aux0 optim.name=adamw loss.aux_coef=0 parallel.activation_checkpointing=true
+
+# C.4  deepseek at --scale regular (7.12B total / 1.28B active, 90% of params in the
+#      experts) on ONE GPU. Weights + grads + Muon momentum + AdamW states are ~82 GiB
+#      in fp32, so the micro-batch drops 16 -> 2 and activation checkpointing is on to
+#      leave headroom on a 141 GB H200. grad_accum 16 -> 128 keeps tokens/step at the
+#      same 524,288 as every other cell, so the loss curve stays comparable.
+#      n_steps is 200, not 2000: ~8x the active params means ~8x the step time, and
+#      2000 steps here would be ~2 days. If it still OOMs, halve data.batch_size to 1
+#      and double data.grad_accum to 256.
+TIME=24h RESUME=1 NOTES="deepseek regular (7B) scale check, 1 GPU" \
+run deepseek-regular-trial model.scale=regular data.batch_size=2 data.grad_accum=128 \
+    parallel.activation_checkpointing=true train.n_steps=200
 
 # =====================================================================================
 # D — longer runs (multi-GPU, resumable)

@@ -11,6 +11,8 @@ run there describe the same network.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Literal, Optional
 
@@ -111,6 +113,9 @@ class ModelConfig:
 class LossConfig:
     aux_coef: float = 0.01       # load-balancing (Switch/Fedus), mean over layers
     z_coef: float = 1e-4         # router z-loss (Zoph et al.), mean over layers
+    # Memory knob, not an objective change: rows per chunk of the LM cross-entropy
+    # (0 = one shot). Does not alter the loss or its gradient. See losses.py.
+    lm_chunk_rows: int = 4096
 
 
 @dataclass
@@ -142,7 +147,7 @@ class DataConfig:
     source: str = "stream"       # stream | synthetic
     seq_len: int = 2048
     batch_size: int = 16         # micro-batch per rank
-    grad_accum: int = 4
+    grad_accum: int = 16
     num_workers: int = 4
     eval_batches: int = 10
     tokenizer: str = "cl100k"
@@ -151,7 +156,7 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    n_steps: int = 20_000
+    n_steps: int = 2_000
     seed: int = 42
     log_every: int = 10
     eval_every: int = 500
@@ -161,18 +166,36 @@ class TrainConfig:
     auto_resume: bool = False
     device: Optional[str] = None
     dry_run: bool = False        # 100 steps, eval at 50
+    # A step whose loss or grad norm is non-finite is dropped rather than applied.
+    # Isolated spikes are survivable; this many in a row means something is broken.
+    max_consecutive_skips: int = 5
 
 
 @dataclass
 class LoggingConfig:
     wandb: bool = True
-    project: str = "moe-expert-imbalance"
+    project: str = "moe-baseline"
     entity: Optional[str] = None
     tag: Optional[str] = None
     group: Optional[str] = None
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
     load_stats: bool = True       # per-layer gini / dead-expert fraction
+
+
+# Fields that cannot change what a run learns, and so must not change its name.
+# Everything NOT listed here feeds the fingerprint -- which is the point: a new
+# option is part of the run's identity by default, and has to be excluded on
+# purpose. `train.seed` is excluded because run_name spells it out separately.
+_MISSING = object()
+_NAME_IGNORE_SECTIONS = ("logging",)
+_NAME_IGNORE_FIELDS = {
+    "train": ("save_dir", "resume", "auto_resume", "device", "log_every", "eval_every",
+              "save_every", "dry_run", "max_consecutive_skips", "seed"),
+    "data": ("num_workers", "eval_batches"),
+    "parallel": ("compile", "activation_checkpointing"),
+    "loss": ("lm_chunk_rows",),
+}
 
 
 @dataclass
@@ -194,6 +217,33 @@ class Config:
             if val not in allowed:
                 raise ValueError(f"{key} must be one of {allowed}, got {val!r}")
 
+    def significant_overrides(self) -> dict:
+        """{dotted key: value} for every learning-relevant field that differs from
+        the dataclass defaults. This -- not a curated list -- is what identifies a
+        run. Diffing against the defaults (rather than hashing the whole config)
+        keeps names stable when a new field with a default is added to config.py.
+        """
+        cur, base = self.to_dict(), Config().to_dict()
+        out = {}
+        for section, fields in cur.items():
+            if section in _NAME_IGNORE_SECTIONS:
+                continue
+            ignored = _NAME_IGNORE_FIELDS.get(section, ())
+            for k, v in fields.items():
+                if k not in ignored and v != base[section].get(k, _MISSING):
+                    out[f"{section}.{k}"] = v
+        return out
+
+    def fingerprint(self) -> str:
+        """Six hex characters standing for everything the readable part of the name
+        leaves out -- batch size, grad accum, seq len, n_steps, widths, warmup, ...
+        Two runs share a checkpoint prefix only if they really are the same run."""
+        sig = self.significant_overrides()
+        if not sig:
+            return "base"
+        blob = json.dumps(sig, sort_keys=True, default=str)
+        return hashlib.blake2s(blob.encode(), digest_size=3).hexdigest()
+
     def condition_name(self) -> str:
         """run_name() without the seed or the batch tag: one value per experimental
         condition. Used as the wandb group, so repeated runs of a condition (other
@@ -204,7 +254,7 @@ class Config:
             return f"{x:g}"
         return (f"{self.model.arch}-{self.model.scale}-{self.optim.name}"
                 f"-aux{fmt(self.loss.aux_coef)}-z{fmt(self.loss.z_coef)}"
-                f"-lr{fmt(self.optim.lr)}")
+                f"-lr{fmt(self.optim.lr)}-{self.fingerprint()}")
 
     def run_name(self) -> str:
         """Encodes every field that distinguishes a baseline cell, so two runs can

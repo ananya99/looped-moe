@@ -76,23 +76,23 @@ def test_spearman_averages_ties_instead_of_inventing_an_order():
 def test_load_metrics_reports_layer_series_and_their_means():
     c = torch.tensor([[0, 0, 4, 12], [4, 4, 4, 4]])
     m = load_metrics(c)
-    assert m["load_layer/dead_fraction/00"] == pytest.approx(0.5)
-    assert m["load_layer/dead_fraction/01"] == pytest.approx(0.0)
+    assert m["load_per_layer/dead_fraction/00"] == pytest.approx(0.5)
+    assert m["load_per_layer/dead_fraction/01"] == pytest.approx(0.0)
     assert m["load/dead_expert_fraction"] == pytest.approx(0.25)
-    assert m["load_layer/gini/01"] == pytest.approx(0.0)
-    assert m["load/gini_max_layer"] == pytest.approx(m["load_layer/gini/00"])
+    assert m["load_per_layer/gini/01"] == pytest.approx(0.0)
+    assert m["load/gini_max_layer"] == pytest.approx(m["load_per_layer/gini/00"])
 
 
 def test_per_layer_series_can_be_switched_off():
     m = load_metrics(torch.tensor([[1, 2, 3, 4]]), per_layer=False)
-    assert not any("load_layer/" in k for k in m)
+    assert not any("load_per_layer/" in k for k in m)
     assert "load/gini" in m
 
 
 def test_a_layer_with_no_tokens_is_skipped_rather_than_counted_as_balanced():
     m = load_metrics(torch.tensor([[0, 0, 0, 0], [1, 2, 3, 4]]))
-    assert "load_layer/gini/00" not in m
-    assert m["load/gini"] == pytest.approx(m["load_layer/gini/01"])
+    assert "load_per_layer/gini/00" not in m
+    assert m["load/gini"] == pytest.approx(m["load_per_layer/gini/01"])
 
 
 # ── drift ────────────────────────────────────────────────────────────

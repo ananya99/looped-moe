@@ -283,7 +283,7 @@ the worst-layer variants of the first and fourth. That is the whole `load/`
 section, and it is what you read every run.
 
 `logging.load_stats_per_layer=true` adds four series *per layer* -- 64 at depth 16
--- under `load_layer/`, kept out of `load/` so they do not bury the aggregates.
+-- under `load_per_layer/`, kept out of `load/` so they do not bury the aggregates.
 Off by default: imbalance genuinely varies with depth, but that is a question you
 ask of one run, not a wall of panels in every run.
 

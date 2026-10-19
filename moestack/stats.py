@@ -100,13 +100,13 @@ def load_metrics(counts: torch.Tensor, per_layer: bool = True) -> dict:
         maxfracs.append(float(row.max() / total))
         moms.append(float(row.max() / row.mean().clamp(min=1e-9)))
         if per_layer:
-            # `load_layer/`, not `load/`: wandb sections panels by the metric
+            # `load_per_layer/`, not `load/`: wandb sections panels by the metric
             # prefix, and 4 x n_layers series inside `load/` bury the eight
             # aggregates that are the ones you actually read every run.
-            out[f"load_layer/gini/{li:02d}"] = ginis[-1]
-            out[f"load_layer/gini_alive/{li:02d}"] = alives[-1]
-            out[f"load_layer/dead_fraction/{li:02d}"] = deads[-1]
-            out[f"load_layer/max_over_mean/{li:02d}"] = moms[-1]
+            out[f"load_per_layer/gini/{li:02d}"] = ginis[-1]
+            out[f"load_per_layer/gini_alive/{li:02d}"] = alives[-1]
+            out[f"load_per_layer/dead_fraction/{li:02d}"] = deads[-1]
+            out[f"load_per_layer/max_over_mean/{li:02d}"] = moms[-1]
     if not ginis:
         return {}
     n = len(ginis)

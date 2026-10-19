@@ -79,7 +79,7 @@ class MoELoadStats(Callback):
     `stats.load_metrics`): gini, gini_alive, normalised entropy, dead-expert
     fraction, max/mean, each averaged over layers plus the worst layer.
 
-    `per_layer` additionally emits one series per layer under `load_layer/` --
+    `per_layer` additionally emits one series per layer under `load_per_layer/` --
     4 x n_layers, so 64 at depth 16. Off by default: imbalance really is uneven
     across depth, but 64 panels in every run's dashboard drown the eight
     aggregates. Under EP, max_over_mean is the straggler factor of the busiest rank.

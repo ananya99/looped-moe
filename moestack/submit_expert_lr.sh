@@ -182,12 +182,12 @@ echo "  $ARCH-$SCALE $OPTIMIZER lr=$LR  ${BATCH_SIZE}x${GRAD_ACCUM}x2048 x ${N_S
 
 # Balanced: the load-balancing loss does the work. What the grid has to beat.
 NOTES="balanced reference, aux $AUX_BASELINE" \
-run baseline "loss.aux_coef=$AUX_BASELINE"
+# run baseline "loss.aux_coef=$AUX_BASELINE"
 
 # Imbalanced, untouched. alpha=0 leaves per_expert_lr disabled entirely, so this is
 # the plain baseline in the regime the grid intervenes in.
 NOTES="imbalanced control, no per-expert LR" \
-run a0 "loss.aux_coef=0"
+# run a0 "loss.aux_coef=0"
 
 # -------------------------------------------------------------------------------------
 # 2. The grid: {raw, ema} x alpha, all at aux 0 with normalize on

@@ -43,11 +43,17 @@ parallel:
   mixed_precision: bf16
 
 data:
-  source: stream          # stream | synthetic
+  # disk = the pre-tokenized cache (see moestack/prepare_data.py). Same sequences
+  # as `stream`, but read from a memmap: no 5-50 min shuffle-buffer fill, no
+  # DataLoader workers to hang mid-run, and resume seeks instead of replaying.
+  # 1.16B tokens = 2,211 steps at 16x16x2048; past that it wraps to a 2nd epoch.
+  # Use source=stream to go back to the Hub, source=synthetic for smoke tests.
+  source: disk            # stream | disk | synthetic
+  cache_dir: /mloscratch/homes/anagupta/data/dclm-fp-1.2B
   seq_len: 2048
   batch_size: 16          # per rank
   grad_accum: 16
-  num_workers: 4
+  num_workers: 4          # stream only; disk needs no workers
   eval_batches: 10
 
 train:

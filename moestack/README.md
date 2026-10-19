@@ -32,23 +32,39 @@ config ──► mesh ──► model (pure math) ──► parallelize ──�
 
 ## Running
 
-### Build the token cache first
+### The token cache
 
-A 300-step cluster run spent ~65 % of its wall clock in the HF stream: 50 min
-filling the two 10,000-document shuffle buffers before step 0, ~15 min more for the
-closing eval, and one outright DataLoader hang that cost a whole job. Pre-tokenize
-once and every run after that is GPU-bound:
+`conf/baseline.yaml` already points at a built cache, so there is nothing to do
+unless you need a different one. It exists because a 300-step cluster run spent
+~65 % of its wall clock in the HF stream -- 50 min filling the two 10,000-document
+shuffle buffers before step 0, ~15 min more for the closing eval, and one outright
+DataLoader hang that cost a whole job attempt. None of that was compute.
 
-```bash
-python -m moestack.prepare_data --out /mloscratch/homes/$USER/data/dclm-fp-1.2B
-python -m moestack.train data.source=disk data.cache_dir=/mloscratch/homes/$USER/data/dclm-fp-1.2B
+```yaml
+data:
+  source: disk                                              # stream | disk | synthetic
+  cache_dir: /mloscratch/homes/anagupta/data/dclm-fp-1.2B
 ```
 
-The default size is 1.16 B tokens = 4.6 GB = a 2,000-step run at the baseline config
-plus 10 % headroom. Tokens come from the repo-root loader unmodified, so a `disk` run
-sees the same sequences in the same order as a `stream` run; the eval slice
-reproduces `get_eval_batches`' 10 M-token offset exactly. `disk` is also seekable, so
-resume is instant instead of replaying the stream.
+To build another (CPU job, no GPU needed -- took 34 min: 4.9 min of buffer fill then
+29.2 min at 663k tok/s):
+
+```bash
+python $CSUB -n prep-data --train --node-type h200 --cpus 8 --memory 64G --command \
+  "cd looped-moe && source .venv/bin/activate && mkdir -p logs && \
+   python -m moestack.prepare_data --out /mloscratch/homes/$USER/data/dclm-fp-1.2B \
+     2>&1 | tee -a logs/prep-data.log"
+```
+
+1.16 B tokens = 4.64 GB = **2,211 steps** at 16x16x2048. Past that `DiskSource` wraps
+to the start -- a second epoch, silently -- so rebuild with `--tokens 3e9` if you
+plan longer runs. Keep `--num-workers` low: each worker holds its own two
+10,000-document shuffle buffers in RAM, and 8 of them got the build OOM-killed.
+
+Tokens come from the repo-root loader unmodified, so a `disk` run sees the same
+sequences in the same order as a `stream` run, and the eval slice reproduces
+`get_eval_batches`' 10 M-token offset exactly. `disk` is also seekable, so resume
+seeks instead of replaying the stream.
 
 ```bash
 python -m moestack.train                                      # conf/baseline.yaml
@@ -63,9 +79,104 @@ python -m pytest tests -q                                     # all tests, CPU, 
 python -m pytest tests -q -m "not slow"                       # skip compile + 2-process DDP
 ```
 
-Unknown keys and invalid enum values fail at startup. The run name encodes arch,
-scale, optimizer, aux/z coefficients, lr, seed and `logging.tag`, so cells of a sweep
-never overwrite each other's checkpoints.
+Unknown keys and invalid enum values fail at startup. The run name spells out arch,
+scale, optimizer, aux/z coefficients, lr, seed and `logging.tag`, and carries a
+fingerprint of **every** other learning-relevant field that differs from the defaults
+(batch size, grad accum, seq len, n_steps, warmup, data source, ...), so cells of a
+sweep cannot overwrite each other's checkpoints. The trainer prints the decoded
+override list at startup, so the hash is never opaque.
+
+## Running on the EPFL cluster
+
+Two workflows. Use **A** to debug interactively on a GPU; use **B** for anything you
+want results from. `csub.py` is the MLO wrapper and is **not in this repo** -- on
+this laptop it is at `/Users/ananyagupta/repos/getting-started/csub.py`. The cluster
+home is `/mloscratch/homes/$USER`, and the repo lives at
+`/mloscratch/homes/$USER/looped-moe` with its venv at `.venv`.
+
+### A. Direct run inside a GPU pod
+
+For a live traceback, a profiler, or poking at a checkpoint. The pod is interactive,
+so the run dies when the pod does -- do not use it for a run you care about.
+
+```bash
+# 1. from the laptop: start a GPU pod. -t is how long the pod lives before it is
+#    torn down (it sleeps for that long), so size it to your debugging session.
+CSUB=/Users/ananyagupta/repos/getting-started/csub.py
+python $CSUB -n dev-gpu -g 1 --node-type h200 -t 8h
+
+runai list jobs                     # wait for Running (image pull takes a moment)
+runai exec dev-gpu -it -- zsh       # 2. shell into it
+
+# 3. inside the pod
+cd ~/looped-moe
+git pull                            # the pod has whatever the checkout last had
+source .venv/bin/activate
+
+# 4. run. `python -m`, not `python moestack/train.py` -- it is a package.
+python -m moestack.train data.source=synthetic train.dry_run=true logging.wandb=false
+python -m moestack.train loss.aux_coef=0 train.n_steps=300
+torchrun --standalone --nproc_per_node=4 -m moestack.train      # multi-GPU, needs -g 4
+
+# 5. from the laptop, when done -- an idle GPU pod still holds the GPU
+runai delete job dev-gpu
+```
+
+### B. Submit a job from the laptop
+
+`submit_moestack_runs.sh` runs each job from the cluster checkout, and **there is no
+branch guard**: if you forget to pull there, you silently train the old code. The job
+echoes `commit <sha>` (plus ` (dirty)`) as the first line of its log -- check it
+against what you pushed.
+
+```bash
+# 1. laptop: commit and push. Nothing reaches the cluster otherwise.
+git add -A && git commit -m "..." && git push
+
+# 2. laptop: a CPU pod is enough to drive git and runai (skip if dev-cpu is up)
+python /Users/ananyagupta/repos/getting-started/csub.py -n dev-cpu
+runai list jobs
+
+# 3. pull inside the cluster -- the step that is easy to forget
+runai exec dev-cpu -- bash -c "cd ~/looped-moe && git pull && git log --oneline -1"
+
+# 4. laptop: look before you leap, then submit by exact name
+bash submit_moestack_runs.sh --dry parity | grep '>>'
+bash submit_moestack_runs.sh --trial parity     # 100 steps, wandb tag "trial"
+bash submit_moestack_runs.sh parity             # the real thing
+#   no name at all submits EVERY run in the file -- 17 jobs
+
+# 5. monitor
+runai list jobs                                 # STATUS: Pending/Running/Failed
+runai describe job ms-parity-<batch>            # why it died (e.g. OOMKILLED)
+runai logs ms-parity-<batch> | grep -v httpx
+runai delete job ms-parity-<batch>
+```
+
+Knobs on the submit script: `NODE_TYPE` (h200), `TIME` (16h, enforced by `timeout`
+inside the container), `BACKOFF` (4 retries), `BATCH` (the tag that keeps
+submissions from colliding). Per-run: `GPUS=n`, `RESUME=1`, `NOTES=".."`.
+
+**Reading the output.** `runai logs` can lag and truncate -- a 2,647-line run showed
+1,335 lines through it. The authoritative copy is the tee'd file:
+
+```bash
+runai exec dev-cpu -- bash -c \
+  "grep -vE 'httpx|HTTP Request' ~/looped-moe/logs/ms-parity-<batch>.log | tail -40"
+```
+
+Checkpoints and `<run_name>_results.json` land in `~/looped-moe/checkpoints/`;
+per-expert JSONLs sit beside them. wandb groups runs by `Config.condition_name()`,
+so seeds of one cell plot together.
+
+**Things that have actually gone wrong here**, so check them first:
+
+| Symptom | Cause |
+|---|---|
+| `enable_gqa` / `torch.optim.Muon` missing, 26 tests instead of 50 | ran the system python; `source .venv/bin/activate` |
+| `OOMKILLED` during `prepare_data` | too many `--num-workers`; each holds 2x10,000 docs in RAM |
+| Job runs code you did not write | forgot step 3; check the `commit <sha>` log line |
+| Minutes of silence before step 0 | `data.source=stream`; use the `disk` cache |
 
 ## What is the same as `imbalance_train.py` (baseline cell)
 

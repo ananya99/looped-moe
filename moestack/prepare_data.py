@@ -61,16 +61,22 @@ def build(out: Path, n_tokens: int, seq_len: int, batch_size: int, num_workers: 
             "built": time.strftime("%Y-%m-%d %H:%M:%S")}
     assert ds.vocab_size < 2 ** 32, ds.vocab_size
 
-    arr = np.memmap(tok_path, dtype=np.uint32, mode="w+", shape=(n_tokens,))
+    arr = None
     written, t0 = 0, time.time()
     last_t, last_written, fill_secs = 0.0, 0, None
     print(f"filling the shuffle buffers ({num_workers} workers x 2 x 10,000 docs); "
           f"no output until the first batch, ~20 min is normal", flush=True)
     try:
         for inp, tgt in loader:
-            if fill_secs is None:
+            if arr is None:
+                # Allocated on the first batch, not up front: the buffer fill is
+                # where this dies (OOM, a Hub stall), and a build killed there
+                # should leave nothing behind rather than a sparse n_tokens*4 file
+                # with no meta.json next to it.
                 fill_secs = time.time() - t0
                 print(f"  first batch after {fill_secs / 60:.1f} min", flush=True)
+                arr = np.memmap(tok_path, dtype=np.uint32, mode="w+", shape=(n_tokens,))
+                meta_path.write_text(json.dumps(meta, indent=2))
             # One window of seq_len+1 tokens per row, exactly as the stream carved it.
             window = torch.cat([inp, tgt[:, -1:]], dim=1).numpy().astype(np.uint32)
             flat = window.reshape(-1)
@@ -95,12 +101,13 @@ def build(out: Path, n_tokens: int, seq_len: int, batch_size: int, num_workers: 
     except KeyboardInterrupt:
         print("\ninterrupted -- keeping what was written", flush=True)
     finally:
-        arr.flush()
-        del arr
-        # A short build leaves the tail unwritten; drop it so the file is all data.
-        os.truncate(tok_path, written * 4)
-        meta["n_tokens"] = written
-        meta_path.write_text(json.dumps(meta, indent=2))
+        if arr is not None:
+            arr.flush()
+            del arr
+            # A short build leaves the tail unwritten; drop it so the file is all data.
+            os.truncate(tok_path, written * 4)
+            meta["n_tokens"] = written
+            meta_path.write_text(json.dumps(meta, indent=2))
 
     secs = time.time() - t0
     stream_secs = max(secs - (fill_secs or 0), 1e-9)
@@ -121,9 +128,11 @@ def main():
                    help=f"tokens to write (default {DEFAULT_TOKENS:,} = 2,000 steps + 10%%)")
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--batch-size", type=int, default=64, help="build-time only")
-    p.add_argument("--num-workers", type=int, default=8,
-                   help="build-time only; each worker fills its own 2x10,000-doc "
-                        "shuffle buffers before producing anything")
+    p.add_argument("--num-workers", type=int, default=2,
+                   help="build-time only. Each worker holds its own 2x10,000-document "
+                        "shuffle buffers in RAM, so this is the memory knob: 8 workers "
+                        "OOM-killed a cluster job, 2 completed. Raise it only with "
+                        "matching --memory, and watch the first progress line.")
     p.add_argument("--tokenizer", default="cl100k")
     p.add_argument("--insert-separator", default="before", choices=["before", "after", "none"])
     a = p.parse_args()

@@ -112,7 +112,9 @@ def lr_scales_from_counts(
 
 
 def scale_summary(scales: torch.Tensor, counts: torch.Tensor,
-                  base_lr: float | None = None) -> dict:
+                  base_lr: float | None = None,
+                  clamp_min: float | None = None,
+                  clamp_max: float | None = None) -> dict:
     """Aggregates for wandb. The full `[L, E]` matrix is far too wide to log, so
     the dashboard gets the spread and the joint distribution goes to a file.
 
@@ -145,6 +147,14 @@ def scale_summary(scales: torch.Tensor, counts: torch.Tensor,
                                   if n_alive and float(alive_scales.min()) > 0 else nan),
         "lr_scale/frozen_fraction": float((s == 0).float().mean()) if s.numel() else nan,
     }
+    if clamp_min is not None and clamp_max is not None and n_alive:
+        # With normalize on, `mean_alive` is 1.0 by construction -- the rule
+        # redistributes rate, it does not raise or lower it. Clamping is the one
+        # thing that breaks that, because it is applied *after* normalisation.
+        # Non-zero here is the warning that `mean_alive` has drifted off 1.0 and
+        # the sweep is no longer comparing equal-average cells.
+        at_bound = (alive_scales <= clamp_min) | (alive_scales >= clamp_max)
+        out["lr_scale/clamped_fraction"] = float(at_bound.float().mean())
     if base_lr is not None:
         out.update({
             "expert_lr/min": out["lr_scale/min"] * base_lr,

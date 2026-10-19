@@ -121,6 +121,11 @@ class PerExpertLR(Callback):
     def __init__(self, cfg):
         self.cfg = cfg
         self.ema = None
+        # Running sum of the multipliers, so the dashboard can show the
+        # time-averaged rate each expert actually ran at. The instantaneous spread
+        # bounces every step; what moves the weights is the integral, and an expert
+        # that is hot early and cold later averages back to 1.0.
+        self.cum, self.cum_n = None, 0
 
     def on_train_start(self, trainer):
         if not trainer.optimizers.expert_lr_groups():
@@ -156,13 +161,27 @@ class PerExpertLR(Callback):
         # rather than assume it -- a future rule may move experts off the full LR).
         group = next(iter(trainer.optimizers.expert_lr_groups().values()))[0]
         state.metrics.update(scale_summary(scales, counts,
-                                           base_lr=state.lr * group["lr_mult"]))
+                                           base_lr=state.lr * group["lr_mult"],
+                                           clamp_min=c.clamp_min, clamp_max=c.clamp_max))
+
+        f = scales.detach().float()
+        self.cum = f.clone() if self.cum is None else self.cum + f
+        self.cum_n += 1
+        alive = counts > 0
+        if int(alive.sum()):
+            m = (self.cum / self.cum_n)[alive]
+            lo = float(m.min())
+            state.metrics["lr_scale/cum_spread_alive"] = (
+                float(m.max()) / lo if lo > 0 else float("nan"))
 
     def state_dict(self):
-        return {"ema": None if self.ema is None else self.ema.cpu()}
+        return {"ema": None if self.ema is None else self.ema.cpu(),
+                "cum": None if self.cum is None else self.cum.cpu(),
+                "cum_n": self.cum_n}
 
     def load_state_dict(self, sd):
         self.ema = sd.get("ema")
+        self.cum, self.cum_n = sd.get("cum"), sd.get("cum_n", 0)
 
 
 class ExpertStats(Callback):

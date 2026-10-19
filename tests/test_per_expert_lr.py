@@ -536,7 +536,8 @@ def test_ema_zero_runs_the_rule_on_raw_counts(tmp_path):
     t = _train(tmp_path, alpha=0.5, ema=0.0, steps=2)
     cb = next(c for c in t.callbacks.callbacks if isinstance(c, PerExpertLR))
     assert cb.ema is None          # never built, so nothing to checkpoint
-    assert t.callbacks.state_dict()["PerExpertLR"] == {"ema": None}
+    # cum/cum_n are also checkpointed; the point here is that no EMA was built.
+    assert t.callbacks.state_dict()["PerExpertLR"]["ema"] is None
 
 
 def test_callback_refuses_optimizers_without_addressable_experts(tmp_path):

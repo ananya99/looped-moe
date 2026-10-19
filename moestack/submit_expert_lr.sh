@@ -97,6 +97,7 @@ COMMON=(
     "data.batch_size=$BATCH_SIZE" "data.grad_accum=$GRAD_ACCUM"
     "train.n_steps=$N_STEPS" "train.seed=$SEED"
     "logging.expert_stats_every=$STATS_EVERY"
+    "logging.load_stats_per_layer=true"
 )
 
 # The disk cache wraps silently, so say so before 10 jobs quietly train two epochs.

@@ -17,7 +17,8 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from . import checkpoint
-from .callbacks import CallbackList, ConsoleLogger, MoELoadStats, StepState, WandbLogger
+from .callbacks import (CallbackList, ConsoleLogger, ExpertStats, MoELoadStats, PerExpertLR,
+                        StepState, WandbLogger)
 from .config import Config
 from .data import build_eval_batches, build_train_iterator
 from .initialization import init_weights
@@ -51,9 +52,16 @@ class Trainer:
         self.fwd = parallelize(self.model, cfg.parallel, d)    # what we call forward on
         self.n_params = sum(p.numel() for p in self.model.parameters())
 
-        self.optimizers = build_optimizers(self.model, cfg.optim, verbose=self.verbose)
+        # split_experts puts each layer's expert tensors in their own param groups,
+        # which is what makes them individually addressable; it changes no arithmetic.
+        self.optimizers = build_optimizers(self.model, cfg.optim, verbose=self.verbose,
+                                           split_experts=cfg.optim.per_expert_lr.enabled)
 
-        cbs = [MoELoadStats()] if cfg.logging.load_stats else []
+        cbs = [MoELoadStats(cfg.logging.load_stats_per_layer)] if cfg.logging.load_stats else []
+        if cfg.optim.per_expert_lr.enabled:
+            cbs.append(PerExpertLR(cfg.optim.per_expert_lr))
+        if cfg.logging.expert_stats_every:
+            cbs.append(ExpertStats(cfg.logging.expert_stats_every))
         cbs += list(callbacks or [])
         cbs.append(ConsoleLogger(cfg.train.log_every))
         if cfg.logging.wandb and d.is_main:

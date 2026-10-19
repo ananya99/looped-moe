@@ -14,11 +14,16 @@ Events (in order within a step):
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
+
+from .expert_lr import ema_update, lr_scales_from_counts, scale_summary
+from .stats import delta_norms, drift_metrics, gini, load_metrics, row_norms
 
 
 @dataclass
@@ -69,33 +74,183 @@ class CallbackList(Callback):
 # Standard callbacks
 # ──────────────────────────────────────────────────────────────────────
 
-def gini(x: torch.Tensor) -> float:
-    x = x.float().flatten().sort().values
-    n = x.numel()
-    if n == 0 or x.sum() <= 0:
-        return 0.0
-    idx = torch.arange(1, n + 1, dtype=x.dtype, device=x.device)
-    return float(((2 * idx - n - 1) * x).sum() / (n * x.sum()))
-
-
 class MoELoadStats(Callback):
-    """Per-step routing balance from the exact global-batch counts:
-    load/gini, load/dead_expert_fraction, load/max_over_mean (layer means), plus the
-    worst layer. Under EP, max_over_mean is the straggler factor of the busiest rank."""
+    """Per-step routing balance from the exact global-batch counts (see
+    `stats.load_metrics`): gini, gini_alive, normalised entropy, dead-expert
+    fraction, max/mean, each averaged over layers plus the worst layer.
+
+    `per_layer` additionally emits one series per layer, which is 4 x n_layers
+    series -- fine for wandb at these depths, and imbalance is very uneven across
+    depth. Under EP, max_over_mean is the straggler factor of the busiest rank.
+    """
+
+    def __init__(self, per_layer: bool = True):
+        self.per_layer = per_layer
 
     def on_step_end(self, trainer, state):
-        c = state.expert_counts
-        if c is None:
+        if state.expert_counts is None:
             return
-        c = c.float()
-        ginis = [gini(row) for row in c]
-        mom = (c.max(dim=1).values / c.mean(dim=1).clamp(min=1e-9))
-        state.metrics.update({
-            "load/gini": sum(ginis) / len(ginis),
-            "load/gini_max_layer": max(ginis),
-            "load/dead_expert_fraction": float((c == 0).float().mean()),
-            "load/max_over_mean": float(mom.mean()),
-        })
+        state.metrics.update(load_metrics(state.expert_counts, per_layer=self.per_layer))
+
+
+class PerExpertLR(Callback):
+    """Per-expert learning rates, derived from this step's routing.
+
+    The whole intervention is: read the exact global-batch expert counts the
+    trainer already computed, turn them into one multiplier per expert
+    (`expert_lr.lr_scales_from_counts`), and write them onto the Muon param groups
+    (`Optimizers.set_expert_lr_scales`). No change to the loop, the model or the
+    gradients -- which is the point: Muon's Newton-Schulz step normalises the
+    update's singular values, so scaling a gradient does nothing and only the
+    learning rate survives.
+
+    Two things the original trainer had to arrange by hand are free here:
+
+    - `state.expert_counts` is already summed over every micro-batch and
+      all-reduced across ranks before any callback runs, so every replica derives
+      identical multipliers. (Diverging per-rank LRs would silently desynchronise
+      the replicas -- nothing would crash.)
+    - The counts come from `RouterOut`, not forward hooks, so activation
+      checkpointing replaying the forward inside backward cannot double them.
+
+    The EMA is checkpointed, so a resumed run continues with a warm average rather
+    than re-seeding from one step's counts.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ema = None
+
+    def on_train_start(self, trainer):
+        if not trainer.optimizers.expert_lr_groups():
+            # Config validation catches optim.name=adamw; this catches a Trainer
+            # that built its optimizers without split_experts=True.
+            raise RuntimeError("PerExpertLR: no per-layer expert param groups -- "
+                               "build_optimizers(..., split_experts=True) is required")
+        if trainer.verbose:
+            c = self.cfg
+            print(f"  per-expert LR: alpha={c.alpha} freeze_dead={c.freeze_dead} "
+                  f"ema={c.ema} normalize={c.normalize} "
+                  f"clamp=[{c.clamp_min}, {c.clamp_max}]")
+
+    def on_before_optimizer_step(self, trainer, state):
+        counts = state.expert_counts
+        if counts is None:
+            return
+        c = self.cfg
+        # Smoothed counts drive the share (per-step counts are very noisy exactly
+        # where n_e is small); deadness stays on this step's raw counts, or an
+        # expert with EMA history could never be recognised as dead.
+        if c.ema > 0:
+            self.ema = ema_update(self.ema, counts, c.ema)
+            driving = self.ema
+        else:
+            driving = counts.float()
+        scales = lr_scales_from_counts(driving, alpha=c.alpha, freeze_dead=c.freeze_dead,
+                                       normalize=c.normalize, clamp_min=c.clamp_min,
+                                       clamp_max=c.clamp_max, dead_counts=counts)
+        trainer.optimizers.set_expert_lr_scales(scales)
+        # The base rate an expert group would run at without the rule: the
+        # scheduled LR times that group's lr_mult (1.0 for experts, but read it
+        # rather than assume it -- a future rule may move experts off the full LR).
+        group = next(iter(trainer.optimizers.expert_lr_groups().values()))[0]
+        state.metrics.update(scale_summary(scales, counts,
+                                           base_lr=state.lr * group["lr_mult"]))
+
+    def state_dict(self):
+        return {"ema": None if self.ema is None else self.ema.cpu()}
+
+    def load_state_dict(self, sd):
+        self.ema = sd.get("ema")
+
+
+class ExpertStats(Callback):
+    """How far each expert actually moved, next to how many tokens it saw.
+
+    Per-expert series are far too wide for wandb (64 experts x 16 layers = 1024
+    series per quantity), so the dashboard gets the correlations and the full joint
+    distribution goes to `<save_dir>/<run_name>_expert_stats.jsonl`, one record per
+    measured step. That file is what an offline analysis of "does token count
+    predict learning" is computed from.
+
+    The measurement brackets the optimizer step: a snapshot of the expert tensors
+    at `on_before_optimizer_step`, the difference at `on_step_end`. Snapshots go to
+    host memory -- at `regular` scale the expert weights are a sizeable fraction of
+    a GPU, and this runs on a cadence precisely because it is not free.
+
+    Steps the trainer *drops* (non-finite loss or grad norm) are skipped rather
+    than recorded: no optimizer step ran, so every drift would be exactly zero and
+    the correlation would be meaningless rather than absent.
+    """
+
+    def __init__(self, every: int, path=None):
+        self.every, self.path = every, path
+        self._before = None
+        self._fh = None
+
+    # -- plumbing ------------------------------------------------------
+    def _experts(self, trainer):
+        return [(m.experts.gate_up_proj, m.experts.down_proj)
+                for m in trainer.model.moe_layers()]
+
+    def _due(self, step):
+        return self.every > 0 and step % self.every == 0
+
+    def on_train_start(self, trainer):
+        if self.every > 0 and self.path is None:
+            self.path = Path(trainer.save_dir) / f"{trainer.run_name}_expert_stats.jsonl"
+
+    def on_before_optimizer_step(self, trainer, state):
+        if not self._due(state.step):
+            return
+        # .to("cpu") also detaches the copy from the GPU allocator, so the peak is
+        # one transfer rather than a second resident copy of the expert weights.
+        self._before = [(g.detach().to("cpu", copy=True), d.detach().to("cpu", copy=True))
+                        for g, d in self._experts(trainer)]
+
+    def on_step_end(self, trainer, state):
+        before, self._before = self._before, None
+        if before is None or state.expert_counts is None:
+            return
+        if not (math.isfinite(state.grad_norm)
+                and math.isfinite(state.metrics.get("train/loss", float("nan")))):
+            return                      # the trainer dropped this step; nothing moved
+        after = [(g.detach().to("cpu", copy=True), d.detach().to("cpu", copy=True))
+                 for g, d in self._experts(trainer)]
+        d_gate = torch.stack([delta_norms(b[0], a[0]) for b, a in zip(before, after)])
+        d_down = torch.stack([delta_norms(b[1], a[1]) for b, a in zip(before, after)])
+        # One number per expert: the norm of its whole step, both matrices together.
+        drift = (d_gate.square() + d_down.square()).sqrt()
+        counts = state.expert_counts.cpu()
+        state.metrics.update(drift_metrics(counts, drift))
+
+        if trainer.dist.is_main and self.path is not None:
+            scales = [g["lr_scale"] for layer, gs in
+                      sorted(trainer.optimizers.expert_lr_groups().items()) for g in gs[:1]]
+            self._write({
+                "step": state.step,
+                "lr": state.lr,
+                "counts": counts.tolist(),
+                "drift": drift.tolist(),
+                "drift_gate_up": d_gate.tolist(),
+                "drift_down": d_down.tolist(),
+                "weight_norm_gate_up": torch.stack([row_norms(a[0]) for a in after]).tolist(),
+                "weight_norm_down": torch.stack([row_norms(a[1]) for a in after]).tolist(),
+                "lr_scale": [s.tolist() for s in scales] if scales and scales[0] is not None
+                            else None,
+            })
+
+    def _write(self, record: dict):
+        if self._fh is None:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self._fh = Path(self.path).open("a")
+        self._fh.write(json.dumps(record) + "\n")
+        self._fh.flush()        # a killed job keeps every record it already measured
+
+    def on_train_end(self, trainer, state):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
 
 
 class ConsoleLogger(Callback):

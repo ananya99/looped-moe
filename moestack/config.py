@@ -119,6 +119,31 @@ class LossConfig:
 
 
 @dataclass
+class PerExpertLRConfig:
+    """Per-expert learning rates: `lr_e = base_lr * clamp(s_e ** alpha)`.
+
+    Defaults are the baseline -- `alpha=0` with `freeze_dead=False` makes every
+    multiplier exactly 1.0, which `expert_lr.py` and `optim/muon.py` turn into the
+    unscaled code path, so a default run is bit-identical to one built before this
+    option existed. See moestack/expert_lr.py for what each field does.
+    """
+    alpha: float = 0.0           # 0 = uniform; 0.5 / 1 = favour hot experts; <0 = cold
+    freeze_dead: bool = False    # zero-token experts take no step and no weight decay
+    # Counts driving the rule are smoothed over ~1/(1-ema) steps; deadness stays on
+    # the raw per-step counts either way. 0.9 is what imbalance_train.py defaulted
+    # to, i.e. what the batch-1 runs in RESULTS.md actually used.
+    ema: float = 0.9
+    normalize: bool = True       # rescale to mean 1.0 over the experts that got tokens
+    clamp_min: float = 1e-3
+    clamp_max: float = 10.0
+
+    @property
+    def enabled(self) -> bool:
+        """Nothing is computed or applied unless a knob is actually turned."""
+        return self.alpha != 0.0 or self.freeze_dead
+
+
+@dataclass
 class OptimConfig:
     name: str = "muon"           # muon | adamw
     lr: float = 2e-2             # base LR; each rule scales it by lr_mult
@@ -128,6 +153,7 @@ class OptimConfig:
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     adamw_betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
+    per_expert_lr: PerExpertLRConfig = field(default_factory=PerExpertLRConfig)
 
 
 @dataclass
@@ -183,6 +209,12 @@ class LoggingConfig:
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
     load_stats: bool = True       # per-layer gini / dead-expert fraction
+    load_stats_per_layer: bool = True
+    # Steps between per-expert records in <save_dir>/<run_name>_expert_stats.jsonl
+    # (counts, per-expert ||dw||, weight norms, LR multipliers) and the drift/*
+    # correlations derived from them. 0 = off. Measurement cadence only: it is in
+    # the `logging` section, so it never changes a run's name or fingerprint.
+    expert_stats_every: int = 0
 
 
 # Fields that cannot change what a run learns, and so must not change its name.
@@ -221,6 +253,19 @@ class Config:
         if self.data.source == "disk" and not self.data.cache_dir:
             raise ValueError("data.source=disk needs data.cache_dir "
                              "(build one with `python -m moestack.prepare_data --out ...`)")
+        pe = self.optim.per_expert_lr
+        if pe.enabled and self.optim.name != "muon":
+            # Under AdamW the experts are single 3D tensors with one scalar lr, so
+            # the rule has nothing to address. Fail at startup, not after the first
+            # step, and never silently no-op.
+            raise ValueError(f"optim.per_expert_lr needs optim.name=muon, got "
+                             f"{self.optim.name!r}: per-expert multipliers are applied "
+                             f"inside Muon's batched step")
+        if not 0.0 <= pe.ema < 1.0:
+            raise ValueError(f"optim.per_expert_lr.ema must be in [0, 1), got {pe.ema}")
+        if not 0.0 <= pe.clamp_min <= pe.clamp_max:
+            raise ValueError(f"optim.per_expert_lr needs 0 <= clamp_min <= clamp_max, "
+                             f"got [{pe.clamp_min}, {pe.clamp_max}]")
 
     def significant_overrides(self) -> dict:
         """{dotted key: value} for every learning-relevant field that differs from
@@ -235,7 +280,16 @@ class Config:
                 continue
             ignored = _NAME_IGNORE_FIELDS.get(section, ())
             for k, v in fields.items():
-                if k not in ignored and v != base[section].get(k, _MISSING):
+                if k in ignored or v == base[section].get(k, _MISSING):
+                    continue
+                if isinstance(v, dict):
+                    # Nested config block (optim.per_expert_lr): report the fields
+                    # that differ, not the whole dict, so the printed override line
+                    # and the fingerprint both stay field-granular.
+                    sub_base = base[section].get(k) or {}
+                    out.update({f"{section}.{k}.{sk}": sv for sk, sv in v.items()
+                                if sv != sub_base.get(sk, _MISSING)})
+                else:
                     out[f"{section}.{k}"] = v
         return out
 
@@ -257,9 +311,17 @@ class Config:
         """
         def fmt(x):
             return f"{x:g}"
+        pe = self.optim.per_expert_lr
+        # "aneg0.5" rather than "a-0.5": a bare minus reads as a separator in both
+        # the filename and the wandb run name (same convention as run_tracking.py).
+        per_expert = ""
+        if pe.alpha != 0.0:
+            per_expert += f"-aneg{fmt(abs(pe.alpha))}" if pe.alpha < 0 else f"-a{fmt(pe.alpha)}"
+        if pe.freeze_dead:
+            per_expert += "-freeze"
         return (f"{self.model.arch}-{self.model.scale}-{self.optim.name}"
                 f"-aux{fmt(self.loss.aux_coef)}-z{fmt(self.loss.z_coef)}"
-                f"-lr{fmt(self.optim.lr)}-{self.fingerprint()}")
+                f"-lr{fmt(self.optim.lr)}{per_expert}-{self.fingerprint()}")
 
     def run_name(self) -> str:
         """Encodes every field that distinguishes a baseline cell, so two runs can

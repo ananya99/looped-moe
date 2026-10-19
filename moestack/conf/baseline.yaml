@@ -22,6 +22,17 @@ optim:
   min_lr_ratio: 0.1
   warmup_steps: 100
   grad_clip: 1.0
+  # Per-expert learning rates. Off by default: alpha=0 with freeze_dead=false
+  # makes every multiplier exactly 1.0 and the run is the plain baseline.
+  #   optim.per_expert_lr.alpha=0.5        lr_e proportional to sqrt(token share)
+  #   optim.per_expert_lr.freeze_dead=true zero-token experts take no step at all
+  per_expert_lr:
+    alpha: 0.0
+    freeze_dead: false
+    ema: 0.9              # smoothing of the counts the rule reads; 0 = raw counts
+    normalize: true       # keep the mean rate over alive experts at 1.0
+    clamp_min: 1.0e-3
+    clamp_max: 10.0
 
 parallel:
   dp: -1                  # -1 = all ranks
@@ -54,6 +65,10 @@ logging:
   project: moe-baseline
   tag: null
   load_stats: true
+  load_stats_per_layer: true
+  # Per-expert JSONL + drift/* correlations every N steps (0 = off). The file is
+  # <save_dir>/<run_name>_expert_stats.jsonl; wandb gets only the aggregates.
+  expert_stats_every: 0
 
 hydra:
   job:

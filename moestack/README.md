@@ -17,11 +17,13 @@ config ──► mesh ──► model (pure math) ──► parallelize ──�
 | `model/moe.py` | `Router` → `Dispatcher` → `GroupedExperts`, returns `RouterOut` | change routing (Router), expert parallelism / comms (Dispatcher), kernels (Experts) |
 | `model/layers.py`, `model/transformer.py` | RMSNorm, RoPE, attention, blocks | change the dense architecture |
 | `losses.py` | `lm + aux_coef·balance + z_coef·z`, each term reported separately | add a loss term |
+| `expert_lr.py` | token counts → one LR multiplier per expert (`s_e**alpha`, freeze-dead, EMA) | change the per-expert LR rule |
+| `stats.py` | gini / entropy / spearman / per-expert drift, as pure functions | add a measurement |
 | `initialization.py` | depth-scaled Xavier (as before) | change init |
 | `optim/builder.py` | tag params by role → `Rule`s → optimizers; LR schedule | change who gets which optimizer/LR/decay |
 | `optim/muon.py` | Muon that takes 3D expert tensors directly (batched Newton–Schulz) | change the optimizer math |
 | `parallel.py` | distributed init, mesh (`dense`, `expert` views), AC → compile → DDP | add FSDP2 / EP / TP |
-| `callbacks.py` | events + `MoELoadStats`, console, wandb | measure or intervene between steps |
+| `callbacks.py` | events + `MoELoadStats`, `PerExpertLR`, `ExpertStats`, console, wandb | measure or intervene between steps |
 | `trainer.py` | the loop (~100 lines, nothing MoE-specific) | rarely — add an event instead |
 | `checkpoint.py` | model + optimizers + data position + RNG + callback state | — |
 | `data.py` | `stream` (repo-root `data.py`, unchanged), `disk` (pre-tokenized cache) or `synthetic` | add a data source |
@@ -51,6 +53,8 @@ resume is instant instead of replaying the stream.
 ```bash
 python -m moestack.train                                      # conf/baseline.yaml
 python -m moestack.train loss.aux_coef=0 train.seed=1         # any field, Hydra syntax
+python -m moestack.train loss.aux_coef=0 optim.per_expert_lr.alpha=0.5 \
+    logging.expert_stats_every=50                             # per-expert LR + measurement
 python -m moestack.train data.source=synthetic train.dry_run=true logging.wandb=false
 torchrun --standalone --nproc_per_node=4 -m moestack.train
 python -m moestack.train --cfg job                            # print the composed config
@@ -105,11 +109,87 @@ Checkpoints are `moestack-v1` files (not HF state dicts). For `eval_downstream.p
 | `test_moe.py` | MoE = naive per-token definition; grouped_mm = loop (fwd + bwd); dispatch conserves tokens; combine with identity experts; permutation equivariance; every parameter receives gradient |
 | `test_losses_and_optim.py` | balance loss = 1 when balanced, ≈E when collapsed; batched Muon = `torch.optim.Muon` per slice (incl. zero-grad expert); role → optimizer table; LR curve = original `get_lr` |
 | `test_training.py` | overfit one batch; grad accumulation = full batch (per-token terms); activation checkpointing is transparent and does not double-count routing; trainer end to end; **resume = uninterrupted run, bit for bit**; EP>1 fails loudly; compile = eager |
-| `test_ddp.py` | 2-process gloo: DDP grads = single-process full-batch grads; replicas stay identical; expert counts are summed over ranks |
+| `test_ddp.py` | 2-process gloo: DDP grads = single-process full-batch grads; replicas stay identical; expert counts are summed over ranks; per-expert multipliers and EMA are byte-identical on every rank |
+| `test_per_expert_lr.py` | the LR rule vs the original `compute_lr_scales`; `lr_scale` in Muon = per-expert LRs; alpha=0 and splitting groups change nothing bit-for-bit; config validation and run names; resume keeps a warm EMA |
+| `test_stats.py` | gini decomposition, Spearman tie handling and NaN, per-layer series, the JSONL's shape and cadence |
 
 Not covered here (needs a GPU): bf16 autocast numerics, CUDA `grouped_mm`, NCCL. First
 thing to run on the cluster: a short `deepseek-tiny` run next to an `imbalance_train.py`
 run with the same seed and data, comparing `train/lm_loss`.
+
+## Per-expert learning rates
+
+The expert-imbalance intervention from `imbalance_train.py`, rebuilt on the seams.
+Off by default: `alpha=0` with `freeze_dead=false` makes every multiplier exactly
+1.0 and the run is bit-identical to one built before the option existed (tested).
+
+```bash
+python -m moestack.train loss.aux_coef=0 optim.per_expert_lr.alpha=0.5
+python -m moestack.train loss.aux_coef=0 optim.per_expert_lr.freeze_dead=true
+python -m moestack.train loss.aux_coef=0 optim.per_expert_lr.alpha=-0.5   # -> ...-aneg0.5-...
+```
+
+| Field | Meaning |
+|---|---|
+| `alpha` | `lr_e ∝ s_e**alpha`, `s_e = n_e / mean(n)`. 0 = uniform, 1 = token-proportional, <0 = compensate cold experts upward |
+| `freeze_dead` | zero-token experts get multiplier 0 — no step **and** no weight decay |
+| `ema` | smoothing of the counts the rule reads (0.9 ≈ 10 steps, as `imbalance_train.py` defaulted to and the batch-1 runs used); deadness always uses the raw per-step counts |
+| `normalize` | rescale to mean 1.0 over the experts that got tokens, so alpha redistributes rate without changing the average |
+| `clamp_min` / `clamp_max` | asymmetric on purpose: a floor only makes an expert slow, a ceiling can destabilise Muon |
+
+How it is wired, in three pieces that each do one thing:
+
+1. `expert_lr.lr_scales_from_counts` — pure `[L, E] → [L, E]`, checked against the
+   original `expert_stats.compute_lr_scales` row by row.
+2. `Muon` groups carry an `lr_scale` vector that scales the step and the decoupled
+   decay per expert. No 2D proxies: the multiplier applies inside the batched
+   Newton-Schulz step. `lr_scale=None` is the unscaled path, byte for byte.
+3. `PerExpertLR` reads `state.expert_counts` — already summed over micro-batches
+   and all-reduced, so every rank derives identical rates — and writes the scales
+   onto the groups. Its EMA is checkpointed.
+
+The multipliers are not gradients, so DDP never synchronises them; what makes the
+ranks agree is that the counts are all-reduced *before* any callback runs. A 2-rank
+test asserts the multipliers, the EMA and the replicas' weights are byte-identical.
+
+Enabling the rule changes the optimizer's param-group layout, so a checkpoint
+written with it cannot be resumed into a baseline run (and vice versa). The run
+names differ anyway; an explicit `train.resume` path pointed across the two now
+fails with a message naming the cause.
+
+`optim.name=adamw` with the rule on fails at startup: there the experts are single
+3D tensors with one scalar LR and nothing is individually addressable.
+
+Scope: expert FFN weights only. Per-expert rates on the matching router row
+(AdamW, not Muon) are a second rule, deliberately not included.
+
+## Measurement
+
+`MoELoadStats` runs every step from the exact global counts: `load/gini`,
+`load/gini_alive`, `load/normalized_entropy`, `load/dead_expert_fraction`,
+`load/max_over_mean`, worst-layer variants, and one series per layer
+(`logging.load_stats_per_layer=false` to drop those).
+
+`gini = dead_fraction + (1 - dead_fraction) · gini_alive` exactly (tested), which
+is why both are logged: a rule that revives dead experts and one that evens out the
+working experts both lower `gini`, and only the split says which happened.
+
+With per-expert LR on, `lr_scale/*` give each expert's rate **relative** to the base
+LR (`spread_alive` = fastest/slowest working expert) and `expert_lr/*` the same in LR
+units, comparable with `train/lr`. Those are before Muon's `adjusted_lr`, which adds
+`sqrt(max(1, out/in))` per shape — so an expert's `down_proj` and `gate_up_proj`
+already differ before any multiplier.
+
+`logging.expert_stats_every=N` adds the part wandb cannot hold. Per step measured it
+brackets the optimizer step with a host-side snapshot of the expert tensors and writes
+`<save_dir>/<run_name>_expert_stats.jsonl`: per-expert counts, `||Δw||` (total and per
+matrix), weight norms and LR multipliers, all `[n_layers][n_experts]`. The dashboard
+gets `drift/corr_share_vs_update` (Spearman, ties averaged, NaN rather than 0 when
+there is no rank variance) and `drift/dead_over_alive` — the zero-token-expert effect
+in one number, which `freeze_dead` should drive to 0. Dropped (non-finite) steps are
+not recorded: no optimizer step ran, so the drift would be zero by construction.
+
+The cadence lives in `logging`, so it never changes a run's name or fingerprint.
 
 ## Where the next pieces go
 
@@ -120,5 +200,7 @@ run with the same seed and data, comparing `train/lm_loss`.
 - **Expert parallelism**: an `AllToAllDispatcher` implementing `dispatch`/`combine`,
   `GroupedExperts(n_local_experts=E/ep)`, and expert grads reduced over `edp` only.
   Test: EP=2 matches EP=1 on loss and grads.
-- **Experiments** (per-expert LR, expert-local accumulation, tying): new `Rule`s, group
-  attributes, or a callback/step policy — not edits to `trainer.py`.
+- **Experiments** (expert-local accumulation, tying): new `Rule`s, group attributes, or
+  a callback/step policy — not edits to `trainer.py`. Per-expert LR, above, is the
+  worked example: a `Rule` flag, a group attribute and one callback, with `trainer.py`
+  changed by two lines that only decide whether to build them.

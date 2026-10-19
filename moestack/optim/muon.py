@@ -10,6 +10,14 @@ which `tests/test_muon.py` checks against the reference slice by slice.
 This replaces the original trainer's 2D-proxy trick (one proxy Parameter per
 expert, grads copied every step): no proxies, no copies, no Python loop over
 experts, and the optimizer state is keyed by the real model parameters.
+
+Per-expert learning rates ride on the same structure. A group may carry an
+`lr_scale` vector of one multiplier per leading-dim slice, which scales that
+expert's step *and* its decoupled weight decay -- so a multiplier of 0 freezes an
+expert completely instead of letting weight decay keep shrinking it. The original
+achieved this by writing `pg["lr"] *= scale` on each proxy's group; here it is a
+group attribute, which is why `trainer.py` needs no per-expert code path.
+`lr_scale=None` is the default and takes the unscaled code path byte for byte.
 """
 
 from __future__ import annotations
@@ -40,6 +48,23 @@ def zeropower_via_newtonschulz(G: torch.Tensor, steps: int = 5, eps: float = 1e-
     return X.mT if transposed else X
 
 
+def _broadcast_scale(scale: torch.Tensor, p: torch.Tensor) -> torch.Tensor:
+    """Reshape a per-slice `lr_scale` [E] to broadcast over a `[E, out, in]` param.
+
+    Only batched (3D) parameters can carry one: a 2D matrix is a single expert's
+    worth of weights and there is nothing to index. Getting this wrong silently
+    scales the wrong experts, so it raises instead.
+    """
+    if not isinstance(scale, torch.Tensor):
+        scale = torch.as_tensor(scale)
+    if p.dim() != 3:
+        raise ValueError(f"lr_scale needs a 3D (batched) parameter, got {tuple(p.shape)}")
+    if scale.dim() != 1 or scale.numel() != p.size(0):
+        raise ValueError(f"lr_scale must be a 1D tensor of length {p.size(0)}, "
+                         f"got {tuple(scale.shape)}")
+    return scale.to(device=p.device, dtype=torch.float32).view(-1, 1, 1)
+
+
 def adjusted_lr(lr: float, shape: torch.Size) -> float:
     out_dim, in_dim = shape[-2], shape[-1]
     return lr * math.sqrt(max(1.0, out_dim / in_dim))
@@ -49,7 +74,7 @@ class Muon(Optimizer):
     def __init__(self, params, lr=2e-2, weight_decay=0.1, momentum=0.95, nesterov=True,
                  ns_steps=5, eps=1e-7):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum,
-                        nesterov=nesterov, ns_steps=ns_steps, eps=eps)
+                        nesterov=nesterov, ns_steps=ns_steps, eps=eps, lr_scale=None)
         super().__init__(params, defaults)
         for g in self.param_groups:
             for p in g["params"]:
@@ -64,6 +89,7 @@ class Muon(Optimizer):
                 loss = closure()
         for g in self.param_groups:
             lr, wd, mom = g["lr"], g["weight_decay"], g["momentum"]
+            scale = g.get("lr_scale")
             for p in g["params"]:
                 if p.grad is None:
                     continue
@@ -75,6 +101,21 @@ class Muon(Optimizer):
                 buf.lerp_(grad, 1 - mom)
                 update = grad.lerp(buf, mom) if g["nesterov"] else buf
                 update = zeropower_via_newtonschulz(update, g["ns_steps"], g["eps"])
-                p.mul_(1 - lr * wd)
-                p.add_(update, alpha=-adjusted_lr(lr, p.shape))
+                # The momentum buffer is updated above regardless of the multiplier:
+                # a frozen expert still sees (zero) gradients, exactly as a proxy
+                # parameter at lr=0 did in the original trainer.
+                if scale is None:
+                    p.mul_(1 - lr * wd)
+                    p.add_(update, alpha=-adjusted_lr(lr, p.shape))
+                else:
+                    s = _broadcast_scale(scale, p)
+                    # float64 for the decay factor so that an all-ones lr_scale is
+                    # bit-identical to the scalar path above, which computes
+                    # `1 - lr * wd` in Python floats.
+                    p.mul_((1.0 - s.double() * (lr * wd)).to(p.dtype))
+                    # `update` is bf16 out of Newton-Schulz and `s` is fp32, so the
+                    # product promotes to fp32 -- the same arithmetic the scalar
+                    # `add_(update, alpha=...)` does, and the multiplier keeps its
+                    # precision instead of being rounded to bf16.
+                    p.add_(update * s, alpha=-adjusted_lr(lr, p.shape))
         return loss

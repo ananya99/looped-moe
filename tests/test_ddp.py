@@ -109,3 +109,50 @@ def test_two_rank_trainer_keeps_replicas_identical(tmp_path):
     assert torch.equal(r["gathered"][0], r["gathered"][1])
     # counts are summed over both ranks' micro-batches: tokens_per_step already includes dp=2
     assert r["seen"] == [r["tokens_per_step"] * 2] * 4
+
+
+def _per_expert_lr_worker(rank, world, port, out_dir):
+    """Per-expert LR under DDP. The multipliers are not gradients, so DDP never
+    synchronises them: if two ranks derived different rates they would take
+    different steps from identical gradients and the replicas would drift apart
+    with nothing raising. What makes them agree is that the trainer all-reduces
+    the expert counts *before* any callback runs."""
+    _setup(rank, world, port)
+    from conftest import tiny_config
+    from moestack.callbacks import PerExpertLR
+    from moestack.trainer import Trainer
+
+    cfg = tiny_config(Path(out_dir) / f"rank{rank}", train=dict(n_steps=3))
+    cfg.optim.per_expert_lr.alpha = 0.5
+    cfg.optim.per_expert_lr.freeze_dead = True   # deadness is decided from counts too
+    cfg.__post_init__()
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+
+    cb = next(c for c in t.callbacks.callbacks if isinstance(c, PerExpertLR))
+    scales = torch.stack([gs[0]["lr_scale"] for _, gs in sorted(t.optimizers.expert_lr_groups().items())])
+    flat = torch.cat([p.detach().flatten() for p in t.model.parameters()])
+    out = {}
+    for name, tensor in (("scales", scales), ("ema", cb.ema), ("weights", flat)):
+        buf = [torch.zeros_like(tensor) for _ in range(world)]
+        dist.all_gather(buf, tensor.contiguous())
+        out[name] = buf
+    out["counts"] = t.args.n_experts
+    if rank == 0:
+        torch.save(out, Path(out_dir) / "per_expert_lr.pt")
+    t.close()
+
+
+@pytest.mark.slow
+def test_per_expert_lr_is_identical_on_every_rank(tmp_path):
+    mp.spawn(_per_expert_lr_worker, args=(2, _free_port(), str(tmp_path)), nprocs=2, join=True)
+    r = torch.load(tmp_path / "per_expert_lr.pt")
+    # Byte-identical, not close: these are derived from an all-reduced integer
+    # count matrix by deterministic arithmetic, so any difference is a bug.
+    assert torch.equal(r["scales"][0], r["scales"][1])
+    assert torch.equal(r["ema"][0], r["ema"][1])
+    # ... and the thing divergence would actually corrupt:
+    assert torch.equal(r["weights"][0], r["weights"][1])
+    # the rule must have been doing something, or this proves nothing
+    assert r["scales"][0].shape[-1] == r["counts"]
+    assert not torch.allclose(r["scales"][0], torch.ones_like(r["scales"][0]))

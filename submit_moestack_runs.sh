@@ -35,9 +35,13 @@
 #   - gets logging.tag=$BATCH, so run names, checkpoints, wandb names and logs of
 #     different submissions never collide. The wandb run name and checkpoint prefix
 #     are derived by Config.run_name() from the config, not from <name>:
-#     {arch}-{scale}-{optim}-aux{..}-z{..}-lr{..}-s{seed}-{tag}. The wandb group is
-#     Config.condition_name() -- the same minus seed and tag -- so seeds of one cell
-#     plot together as mean and spread;
+#     {arch}-{scale}-{optim}-aux{..}-z{..}-lr{..}-{fingerprint}-s{seed}-{tag}, where
+#     {fingerprint} is 6 hex chars over EVERY other learning-relevant field that
+#     differs from the defaults -- batch size, grad accum, seq len, n_steps, warmup,
+#     data source, per-expert LR, ... -- so two cells cannot share a checkpoint
+#     prefix. The trainer prints the decoded override list at startup. The wandb
+#     group is Config.condition_name() -- the same minus seed and tag -- so seeds of
+#     one cell plot together as mean and spread;
 #   - is capped at $TIME by `timeout` in the container, because runai has no wall-clock
 #     flag and csub drops -t whenever --command is given. Keep $TIME well above the
 #     expected runtime: it is a hang guard (HF stream stall, NCCL deadlock), not a
@@ -45,6 +49,13 @@
 #     $TIME is per attempt -- only runs with RESUME=1 progress across retries.
 #
 # Compare runs on train/lm_loss, not train/loss, whenever aux/z coefficients differ.
+#
+# DATA: conf/baseline.yaml defaults to the pre-tokenized cache (data.source=disk),
+# which holds 1.16B tokens = 2,211 steps at 16x16x2048 = 566,129 sequences. A run
+# needing more than that wraps to the start of the cache and silently trains a
+# second epoch. Sequences a run needs = batch_size * grad_accum * n_steps * GPUS.
+# Everything below fits except long-aux0.01 (20k steps = 5.1M sequences, 9x over);
+# give that one data.source=stream or build a bigger cache before trusting it.
 # ===================================================================
 
 set -euo pipefail
@@ -212,6 +223,47 @@ run deepseek-regular-trial model.scale=regular data.batch_size=2 data.grad_accum
 
 GPUS=4 RESUME=1 TIME=48h NOTES="20k-step balanced baseline" \
 run long-aux0.01 train.n_steps=20000 data.grad_accum=4
+
+# =====================================================================================
+# E — per-expert learning rate, imbalanced regime (aux 0), 2000 steps, seed 42
+#     lr_e is proportional to s_e**alpha, renormalised to mean 1.0 over the experts
+#     that got tokens, so alpha redistributes rate without moving the layer average.
+#       alpha  1     token-proportional (restores SGD-like scaling)
+#              0.5   square-root compromise -- the batch-1 winner in docs/RESULTS.md
+#              0.25  weaker version of the same
+#             -0.5   other sign: compensate cold experts upward (harmful in batch 1)
+#     ema 0.9 smooths the counts over ~10 steps; ema 0 drives the rule off this
+#     step's raw counts, which are very noisy exactly where n_e is small. Deadness
+#     is keyed on raw counts either way, so that is not what the pair is testing.
+#
+#     alpha=0 is deliberately ONE cell, not two: `per_expert_lr.enabled` is
+#     (alpha != 0 or freeze_dead), so at alpha=0 the callback is never constructed
+#     and ema/normalize do nothing. Running it per-ema would submit the same
+#     experiment twice under two names.
+# =====================================================================================
+
+# E.0  the control every E cell is read against: imbalanced, no intervention.
+RESUME=1 NOTES="aux0 control, no per-expert LR (alpha=0 makes ema/normalize inert)" \
+run pe-a0 loss.aux_coef=0 logging.expert_stats_every=50
+
+for counts in raw ema; do
+    case $counts in
+        raw) ema=0 ;;       # rule driven by this step's counts
+        ema) ema=0.9 ;;     # smoothed over ~10 steps
+    esac
+    for a in -0.5 0.25 0.5 1; do
+        case $a in
+            -*) lbl="aneg${a#-}" ;;   # -0.5 -> aneg0.5, keeps job names readable
+             *) lbl="a$a" ;;
+        esac
+        RESUME=1 NOTES="per-expert LR alpha=$a on $counts counts, aux0" \
+        run "pe-$counts-$lbl" loss.aux_coef=0 \
+            optim.per_expert_lr.alpha=$a \
+            optim.per_expert_lr.ema=$ema \
+            optim.per_expert_lr.normalize=true \
+            logging.expert_stats_every=50
+    done
+done
 
 # -------------------------------------------------------------------------------------
 [ "$n_matched" -eq 0 ] && {

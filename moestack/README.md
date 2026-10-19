@@ -276,10 +276,16 @@ Scope: expert FFN weights only. Per-expert rates on the matching router row
 
 ## Measurement
 
-`MoELoadStats` runs every step from the exact global counts: `load/gini`,
-`load/gini_alive`, `load/normalized_entropy`, `load/dead_expert_fraction`,
-`load/max_over_mean`, worst-layer variants, and one series per layer
-(`logging.load_stats_per_layer=false` to drop those).
+`MoELoadStats` runs every step from the exact global counts and emits eight
+aggregates: `load/gini`, `load/gini_alive`, `load/normalized_entropy`,
+`load/dead_expert_fraction`, `load/max_expert_fraction`, `load/max_over_mean` and
+the worst-layer variants of the first and fourth. That is the whole `load/`
+section, and it is what you read every run.
+
+`logging.load_stats_per_layer=true` adds four series *per layer* -- 64 at depth 16
+-- under `load_layer/`, kept out of `load/` so they do not bury the aggregates.
+Off by default: imbalance genuinely varies with depth, but that is a question you
+ask of one run, not a wall of panels in every run.
 
 `gini = dead_fraction + (1 - dead_fraction) · gini_alive` exactly (tested), which
 is why both are logged: a rule that revives dead experts and one that evens out the

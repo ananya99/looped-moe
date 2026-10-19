@@ -71,7 +71,9 @@ logging:
   project: moe-baseline
   tag: null
   load_stats: true
-  load_stats_per_layer: true
+  # 4 x n_layers extra series under `load_layer/`; on only when you are
+  # actually asking how imbalance varies with depth.
+  load_stats_per_layer: false
   # Per-expert JSONL + drift/* correlations every N steps (0 = off). The file is
   # <save_dir>/<run_name>_expert_stats.jsonl; wandb gets only the aggregates.
   expert_stats_every: 0

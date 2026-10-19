@@ -209,7 +209,11 @@ class LoggingConfig:
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
     load_stats: bool = True       # per-layer gini / dead-expert fraction
-    load_stats_per_layer: bool = True
+    # Off by default: it is 4 x n_layers extra series (64 at depth 16) against
+    # eight aggregates, which is a wall of panels in every run's dashboard. Turn
+    # it on for the run where you are actually asking how imbalance varies with
+    # depth; they land under `load_layer/`, separate from `load/`.
+    load_stats_per_layer: bool = False
     # Steps between per-expert records in <save_dir>/<run_name>_expert_stats.jsonl
     # (counts, per-expert ||dw||, weight norms, LR multipliers) and the drift/*
     # correlations derived from them. 0 = off. Measurement cadence only: it is in

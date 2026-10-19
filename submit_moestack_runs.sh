@@ -50,6 +50,9 @@
 #
 # Compare runs on train/lm_loss, not train/loss, whenever aux/z coefficients differ.
 #
+# The per-expert learning-rate grid lives in moestack/submit_expert_lr.sh, which
+# hardcodes its own arch/scale/node-type block rather than taking them from here.
+#
 # DATA: conf/baseline.yaml defaults to the pre-tokenized cache (data.source=disk),
 # which holds 1.16B tokens = 2,211 steps at 16x16x2048 = 566,129 sequences. A run
 # needing more than that wraps to the start of the cache and silently trains a
@@ -223,47 +226,6 @@ run deepseek-regular-trial model.scale=regular data.batch_size=2 data.grad_accum
 
 GPUS=4 RESUME=1 TIME=48h NOTES="20k-step balanced baseline" \
 run long-aux0.01 train.n_steps=20000 data.grad_accum=4
-
-# =====================================================================================
-# E — per-expert learning rate, imbalanced regime (aux 0), 2000 steps, seed 42
-#     lr_e is proportional to s_e**alpha, renormalised to mean 1.0 over the experts
-#     that got tokens, so alpha redistributes rate without moving the layer average.
-#       alpha  1     token-proportional (restores SGD-like scaling)
-#              0.5   square-root compromise -- the batch-1 winner in docs/RESULTS.md
-#              0.25  weaker version of the same
-#             -0.5   other sign: compensate cold experts upward (harmful in batch 1)
-#     ema 0.9 smooths the counts over ~10 steps; ema 0 drives the rule off this
-#     step's raw counts, which are very noisy exactly where n_e is small. Deadness
-#     is keyed on raw counts either way, so that is not what the pair is testing.
-#
-#     alpha=0 is deliberately ONE cell, not two: `per_expert_lr.enabled` is
-#     (alpha != 0 or freeze_dead), so at alpha=0 the callback is never constructed
-#     and ema/normalize do nothing. Running it per-ema would submit the same
-#     experiment twice under two names.
-# =====================================================================================
-
-# E.0  the control every E cell is read against: imbalanced, no intervention.
-RESUME=1 NOTES="aux0 control, no per-expert LR (alpha=0 makes ema/normalize inert)" \
-run pe-a0 loss.aux_coef=0 logging.expert_stats_every=50
-
-for counts in raw ema; do
-    case $counts in
-        raw) ema=0 ;;       # rule driven by this step's counts
-        ema) ema=0.9 ;;     # smoothed over ~10 steps
-    esac
-    for a in -0.5 0.25 0.5 1; do
-        case $a in
-            -*) lbl="aneg${a#-}" ;;   # -0.5 -> aneg0.5, keeps job names readable
-             *) lbl="a$a" ;;
-        esac
-        RESUME=1 NOTES="per-expert LR alpha=$a on $counts counts, aux0" \
-        run "pe-$counts-$lbl" loss.aux_coef=0 \
-            optim.per_expert_lr.alpha=$a \
-            optim.per_expert_lr.ema=$ema \
-            optim.per_expert_lr.normalize=true \
-            logging.expert_stats_every=50
-    done
-done
 
 # -------------------------------------------------------------------------------------
 [ "$n_matched" -eq 0 ] && {

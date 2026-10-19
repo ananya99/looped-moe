@@ -4,6 +4,11 @@
                unchanged. Sharded over all ranks, which equals DP ranks here. When
                EP/TP arrive, sharding must follow the *DP* rank only: ranks inside
                one DP group must see the same tokens.
+    disk       a flat uint32 token file built once by `moestack.prepare_data` from
+               the same stream. Seekable, no network, no DataLoader workers -- the
+               tokens are memory-mapped and indexed arithmetically. Preferred for
+               experiments: identical sequences to `stream`, without the ~50 min of
+               shuffle-buffer filling or the risk of a worker hanging mid-run.
     synthetic  deterministic random tokens. Seekable, needs no network or tokenizer;
                for smoke tests, CI and throughput measurements.
 
@@ -14,11 +19,20 @@ it (as the original trainer did); synthetic resumes by skipping instantly.
 
 from __future__ import annotations
 
+import json
+import math
+from pathlib import Path
 from typing import Iterator
 
+import numpy as np
 import torch
 
 from .config import DataConfig
+
+# `data.get_eval_batches` reaches its batches by skipping this many tokens into the
+# stream. The disk source reproduces that offset exactly rather than inventing its
+# own eval set, so disk and stream runs are directly comparable.
+EVAL_SKIP_TOKENS = 10_000_000
 
 
 class SyntheticSource:
@@ -41,6 +55,74 @@ class SyntheticSource:
         while True:
             yield self.batch(i)
             i += 1
+
+
+class DiskSource:
+    """Memory-mapped flat token file written by `moestack.prepare_data`.
+
+    Sequences are carved exactly as the streaming pipeline carves them: contiguous,
+    non-overlapping windows of seq_len+1 tokens yielding (w[:-1], w[1:]). Global
+    micro-batch order matches a DDP stream run -- at optimizer step s, micro-step j,
+    rank r reads global micro-batch (s*accum + j)*world + r -- so ranks never
+    overlap and the global batch is the same set of sequences at any world size.
+    """
+
+    def __init__(self, cache_dir: str, cfg: DataConfig, rank: int = 0, world_size: int = 1):
+        d = Path(cache_dir)
+        meta_path, tok_path = d / "meta.json", d / "tokens.u32"
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"no token cache at {d}. Build one with:\n"
+                f"  python -m moestack.prepare_data --out {d}")
+        self.meta = json.loads(meta_path.read_text())
+        if self.meta.get("format") != "moestack-tokens-v1":
+            raise ValueError(f"{meta_path} is not a moestack token cache")
+        for key, want in (("tokenizer", cfg.tokenizer),
+                          ("insert_separator", cfg.insert_separator)):
+            if self.meta[key] != want:
+                raise ValueError(f"cache was built with {key}={self.meta[key]!r} but this "
+                                 f"run asks for {want!r}; rebuild it or change the config")
+        self.cfg, self.rank, self.world_size = cfg, rank, world_size
+        self.stride = cfg.seq_len + 1
+        self.tokens = np.memmap(tok_path, dtype=np.uint32, mode="r",
+                                shape=(self.meta["n_tokens"],))
+        self.n_seq = self.meta["n_tokens"] // self.stride
+        if self.n_seq < cfg.batch_size:
+            raise ValueError(f"cache holds {self.n_seq} sequences at seq_len={cfg.seq_len}; "
+                             f"need at least one batch of {cfg.batch_size}")
+
+    def _sequences(self, first: int, count: int):
+        """(inp, tgt) for `count` consecutive sequences starting at index `first`,
+        wrapping if the cache runs out (as restarting the stream would)."""
+        idx = (first + np.arange(count)) % self.n_seq
+        rows = self.tokens[(idx[:, None] * self.stride) + np.arange(self.stride)]
+        rows = torch.from_numpy(rows.astype(np.int64))
+        return rows[:, :-1].contiguous(), rows[:, 1:].contiguous()
+
+    def batch(self, i: int):
+        """Micro-batch `i` as counted by *this* rank."""
+        g = i * self.world_size + self.rank
+        return self._sequences(g * self.cfg.batch_size, self.cfg.batch_size)
+
+    def iterator(self, start: int = 0) -> Iterator:
+        i = start
+        while True:
+            yield self.batch(i)
+            i += 1
+
+    def eval_batches(self, n_batches: int) -> list:
+        """The same slice of the stream `data.get_eval_batches` would return: it
+        counts seq_len per sequence and keeps the first whose running total reaches
+        EVAL_SKIP_TOKENS, i.e. sequence index ceil(skip / seq_len) - 1."""
+        first = math.ceil(EVAL_SKIP_TOKENS / self.cfg.seq_len) - 1
+        need = n_batches * self.cfg.batch_size
+        if first + need > self.n_seq:
+            raise ValueError(
+                f"cache holds {self.n_seq:,} sequences, but the eval slice needs "
+                f"{first + need:,} (it starts {EVAL_SKIP_TOKENS:,} tokens in). "
+                f"Rebuild with more --tokens.")
+        inp, tgt = self._sequences(first, need)
+        return list(zip(inp.split(self.cfg.batch_size), tgt.split(self.cfg.batch_size)))
 
 
 class MicroBatchIterator:
@@ -73,7 +155,10 @@ class MicroBatchIterator:
 
 
 def build_train_iterator(cfg: DataConfig, vocab_size: int, seed: int, rank: int,
-                         start: int = 0) -> MicroBatchIterator:
+                         start: int = 0, world_size: int = 1) -> MicroBatchIterator:
+    if cfg.source == "disk":
+        src = DiskSource(cfg.cache_dir, cfg, rank, world_size)
+        return MicroBatchIterator(src.iterator, seekable=True, start=start)
     if cfg.source == "synthetic":
         src = SyntheticSource(vocab_size, cfg, seed, rank)
         return MicroBatchIterator(src.iterator, seekable=True, start=start)
@@ -87,6 +172,9 @@ def build_train_iterator(cfg: DataConfig, vocab_size: int, seed: int, rank: int,
 
 
 def build_eval_batches(cfg: DataConfig, vocab_size: int, seed: int) -> list:
+    if cfg.source == "disk":
+        # rank 0 / world 1: every rank evaluates on the identical slice.
+        return DiskSource(cfg.cache_dir, cfg).eval_batches(cfg.eval_batches)
     if cfg.source == "synthetic":
         # Rank -1 keeps eval disjoint from every training stream and identical on all ranks.
         src = SyntheticSource(vocab_size, cfg, seed, rank=-1)

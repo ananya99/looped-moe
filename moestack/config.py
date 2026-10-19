@@ -144,7 +144,9 @@ class ParallelConfig:
 
 @dataclass
 class DataConfig:
-    source: str = "stream"       # stream | synthetic
+    source: str = "stream"       # stream | disk | synthetic
+    # Token cache for source=disk, built by `python -m moestack.prepare_data`.
+    cache_dir: Optional[str] = None
     seq_len: int = 2048
     batch_size: int = 16         # micro-batch per rank
     grad_accum: int = 16
@@ -192,7 +194,7 @@ _NAME_IGNORE_SECTIONS = ("logging",)
 _NAME_IGNORE_FIELDS = {
     "train": ("save_dir", "resume", "auto_resume", "device", "log_every", "eval_every",
               "save_every", "dry_run", "max_consecutive_skips", "seed"),
-    "data": ("num_workers", "eval_batches"),
+    "data": ("num_workers", "eval_batches", "cache_dir"),
     "parallel": ("compile", "activation_checkpointing"),
     "loss": ("lm_chunk_rows",),
 }
@@ -211,11 +213,14 @@ class Config:
     def __post_init__(self):
         checks = [("optim.name", self.optim.name, ("muon", "adamw")),
                   ("parallel.mixed_precision", self.parallel.mixed_precision, ("bf16", "none")),
-                  ("data.source", self.data.source, ("stream", "synthetic")),
+                  ("data.source", self.data.source, ("stream", "disk", "synthetic")),
                   ("model.experts_impl", self.model.experts_impl, ("grouped_mm", "loop"))]
         for key, val, allowed in checks:
             if val not in allowed:
                 raise ValueError(f"{key} must be one of {allowed}, got {val!r}")
+        if self.data.source == "disk" and not self.data.cache_dir:
+            raise ValueError("data.source=disk needs data.cache_dir "
+                             "(build one with `python -m moestack.prepare_data --out ...`)")
 
     def significant_overrides(self) -> dict:
         """{dotted key: value} for every learning-relevant field that differs from

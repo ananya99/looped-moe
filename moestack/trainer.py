@@ -85,7 +85,8 @@ class Trainer:
         self._stop_requested = False
 
         self.train_iter = build_train_iterator(cfg.data, self.args.vocab_size, cfg.train.seed,
-                                               d.rank, start=data_start)
+                                               d.rank, start=data_start,
+                                               world_size=self.dims.dp)
         self.eval_batches = None    # fetched lazily: the stream burns 10M tokens first
 
         if self.verbose:

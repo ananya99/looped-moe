@@ -24,10 +24,29 @@ config ──► mesh ──► model (pure math) ──► parallelize ──�
 | `callbacks.py` | events + `MoELoadStats`, console, wandb | measure or intervene between steps |
 | `trainer.py` | the loop (~100 lines, nothing MoE-specific) | rarely — add an event instead |
 | `checkpoint.py` | model + optimizers + data position + RNG + callback state | — |
-| `data.py` | `stream` (repo-root `data.py`, unchanged) or `synthetic` | add a data source |
+| `data.py` | `stream` (repo-root `data.py`, unchanged), `disk` (pre-tokenized cache) or `synthetic` | add a data source |
+| `prepare_data.py` | writes the `disk` cache once from the stream | — |
 | `hf_compat.py` | state-dict mapping to/from HF, `to_hf_model()` for eval/export | — |
 
 ## Running
+
+### Build the token cache first
+
+A 300-step cluster run spent ~65 % of its wall clock in the HF stream: 50 min
+filling the two 10,000-document shuffle buffers before step 0, ~15 min more for the
+closing eval, and one outright DataLoader hang that cost a whole job. Pre-tokenize
+once and every run after that is GPU-bound:
+
+```bash
+python -m moestack.prepare_data --out /mloscratch/homes/$USER/data/dclm-fp-1.2B
+python -m moestack.train data.source=disk data.cache_dir=/mloscratch/homes/$USER/data/dclm-fp-1.2B
+```
+
+The default size is 1.16 B tokens = 4.6 GB = a 2,000-step run at the baseline config
+plus 10 % headroom. Tokens come from the repo-root loader unmodified, so a `disk` run
+sees the same sequences in the same order as a `stream` run; the eval slice
+reproduces `get_eval_batches`' 10 M-token offset exactly. `disk` is also seekable, so
+resume is instant instead of replaying the stream.
 
 ```bash
 python -m moestack.train                                      # conf/baseline.yaml
@@ -66,7 +85,8 @@ never overwrite each other's checkpoints.
 | LM loss positions | `labels=input_ids` → HF scores T−1 positions per sequence | scores all T using `targets` | uses the token `data.py` already provides; ≈0.05 % more targets |
 | Balance-loss top-k | re-runs top-k on probs cast to the autocast dtype | uses the router's own fp32 top-k | identical in fp32; avoids picking a different expert on bf16 near-ties |
 | Muon on experts | one 2D proxy `Parameter` per expert + grad copy every step | batched Newton–Schulz on the 3D tensor | same math per matrix (tested vs `torch.optim.Muon`, ≤1 bf16 ulp), no proxies or Python loop over experts |
-| Resume | replays the stream | replays the stream (`stream`), seeks instantly (`synthetic`); restores RNG + callback state | resume is bit-identical to an uninterrupted run (tested) |
+| Resume | replays the stream | replays the stream (`stream`), seeks instantly (`disk`, `synthetic`); restores RNG + callback state | resume is bit-identical to an uninterrupted run (tested) |
+| Data delivery | HF streaming only: ~50 min of shuffle-buffer filling before step 0, and a stuck worker hangs the run with no timeout | `data.source=disk` memory-maps a cache built once by `prepare_data` | measured: ~65 % of a 300-step run's wall clock was the stream, none of it compute |
 | Eval cadence | after step index 500, 1000, … | after 500, 1000, … completed steps | off-by-one cleanup |
 | LM loss memory | one-shot `logits.float()` → ~20 GB held, ~33 GB peak at B=16/T=2048/V=100k | `loss.lm_chunk_rows` (4096) chunks it, each chunk's fp32 cast and log-softmax recomputed in backward | same value and gradient; ~10 GB peak, which is what caps batch size at this vocab |
 | Non-finite step | applied, then the run raises | dropped (`train/skipped_steps`), run aborts after `train.max_consecutive_skips` in a row | a NaN step poisons the weights *and* the next checkpoint before anything notices |

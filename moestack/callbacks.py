@@ -165,7 +165,10 @@ class PerExpertLR(Callback):
                                            clamp_min=c.clamp_min, clamp_max=c.clamp_max))
 
         f = scales.detach().float()
-        self.cum = f.clone() if self.cum is None else self.cum + f
+        # .to(f): a resumed `cum` comes back on CPU (checkpoint.load maps to cpu,
+        # and state_dict() stores it there), the same reason ema_update moves its
+        # own carry-over. Without it the first step after a resume dies.
+        self.cum = f.clone() if self.cum is None else self.cum.to(f) + f
         self.cum_n += 1
         alive = counts > 0
         if int(alive.sum()):

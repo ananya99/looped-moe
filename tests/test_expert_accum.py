@@ -1008,3 +1008,85 @@ def test_the_two_clocks_get_different_names():
     a = _accum_cfg(Path("/tmp"), threshold=512, max_window=8, clock="step").run_name()
     b = _accum_cfg(Path("/tmp"), threshold=512, max_window=8, clock="microbatch").run_name()
     assert "accst" in a and "accmb" in b and a != b
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Stage 6: the record of what happened
+# ──────────────────────────────────────────────────────────────────────
+
+def test_update_counts_have_their_own_inequality_measure():
+    """load/gini says the tokens are unevenly spread. This says the *updates* are
+    -- which on the micro-batch clock can run away even while routing does not."""
+    even, lopsided = AccumState.zeros(1, 4), AccumState.zeros(1, 4)
+    even.events += torch.tensor([[5, 5, 5, 5]])
+    lopsided.events += torch.tensor([[20, 1, 1, 1]])
+    t = EventTally(4)
+    assert accum_metrics(even, t, None)["accum/event_gini"] == 0.0
+    assert accum_metrics(lopsided, t, None)["accum/event_gini"] > 0.4
+
+
+def _events_file(trainer):
+    return Path(trainer.save_dir) / f"{trainer.run_name}_accum_events.jsonl"
+
+
+def _records(trainer):
+    import json
+    return [json.loads(line) for line in _events_file(trainer).read_text().splitlines()]
+
+
+def test_the_events_file_records_every_tick_that_fired(tmp_path):
+    cfg = _accum_cfg(tmp_path, steps=4, threshold=1, max_window=1)
+    cfg.logging.accum_events_every = 1
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    rows = _records(t)
+    assert rows, "nothing was written"
+    r = rows[0]
+    L, E = t.args.n_layers, t.args.n_experts
+    assert len(r["tokens"]) == L and len(r["tokens"][0]) == E
+    assert set(r) == {"step", "tick", "clock", "reason", "threshold", "tokens",
+                      "by_timeout", "pending", "age", "events"}
+    # tokens is zero wherever nothing fired, so it carries the mask too
+    assert any(v > 0 for row in r["tokens"] for v in row)
+
+
+def test_the_cadence_is_respected_and_zero_writes_nothing(tmp_path):
+    cfg = _accum_cfg(tmp_path / "every2", steps=6, threshold=1, max_window=1)
+    cfg.logging.accum_events_every = 2
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    assert {r["step"] for r in _records(t)} <= {0, 2, 4}
+
+    off = Trainer(_accum_cfg(tmp_path / "off", steps=4, threshold=1, max_window=1),
+                  verbose=False)
+    off.fit()
+    assert not _events_file(off).exists()
+
+
+def test_the_microbatch_clock_records_one_row_per_firing_microbatch(tmp_path):
+    cfg = _accum_cfg(tmp_path, steps=2, threshold=1, max_window=1, clock="microbatch")
+    cfg.logging.accum_events_every = 1
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    ticks = [r["tick"] for r in _records(t) if r["step"] == 0 and r["reason"] == "rule"]
+    assert ticks == sorted(ticks) and len(ticks) > 1
+    assert max(ticks) < t.cfg.data.grad_accum
+
+
+def test_the_final_flush_is_recorded_and_says_so(tmp_path):
+    cfg = _accum_cfg(tmp_path, steps=2, threshold=10**9)
+    cfg.logging.accum_events_every = 1
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    rows = _records(t)
+    assert [r["reason"] for r in rows] == ["flush"]       # nothing else ever fired
+    assert rows[0]["step"] == 2
+
+
+def test_the_events_cadence_does_not_change_a_run_name(tmp_path):
+    """It is measurement, so it lives in `logging` and must stay out of the
+    fingerprint -- two runs that differ only in it are the same experiment."""
+    a = _accum_cfg(tmp_path, threshold=100)
+    b = _accum_cfg(tmp_path, threshold=100)
+    b.logging.accum_events_every = 25
+    assert a.run_name() == b.run_name()

@@ -43,6 +43,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .stats import gini
+
 GRAD_SCALES = ("mean", "sum")
 
 
@@ -272,6 +274,13 @@ def accum_metrics(state: AccumState, tally: EventTally, threshold: int | None) -
         "accum/events_per_expert": tally.events / max(tally.slots, 1),
         "accum/waiting_fraction": float((state.pending > 0).to(torch.float32).mean()),
         "accum/never_fired_fraction": float((state.events == 0).to(torch.float32).mean()),
+        # Inequality of *update counts*, not of tokens. 0 means every expert has
+        # updated equally often. This is the tripwire for the loop the scheme can
+        # feed: a hot expert crosses its budget more often, takes more steps,
+        # improves faster, and the router sends it still more. Watch it next to
+        # load/gini -- if this one runs away while that one does not, the extra
+        # steps are doing it, not the routing.
+        "accum/event_gini": gini(state.events),
         "accum/pending_mean": float(pending.mean()),
         "accum/pending_max": float(pending.max()) if pending.numel() else nan,
         # The staleness bound in ticks. If this sits at max_window, the timeout --

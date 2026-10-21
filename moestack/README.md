@@ -18,12 +18,13 @@ config ──► mesh ──► model (pure math) ──► parallelize ──�
 | `model/layers.py`, `model/transformer.py` | RMSNorm, RoPE, attention, blocks | change the dense architecture |
 | `losses.py` | `lm + aux_coef·balance + z_coef·z`, each term reported separately | add a loss term |
 | `expert_lr.py` | token counts → one LR multiplier per expert (`s_e**alpha`, freeze-dead, EMA) | change the per-expert LR rule |
+| `expert_accum.py` | token counts → which experts have accumulated a full window and should update now | change the accumulation rule |
 | `stats.py` | gini / entropy / spearman / per-expert drift, as pure functions | add a measurement |
 | `initialization.py` | depth-scaled Xavier (as before) | change init |
 | `optim/builder.py` | tag params by role → `Rule`s → optimizers; LR schedule | change who gets which optimizer/LR/decay |
 | `optim/muon.py` | Muon that takes 3D expert tensors directly (batched Newton–Schulz) | change the optimizer math |
 | `parallel.py` | distributed init, mesh (`dense`, `expert` views), AC → compile → DDP | add FSDP2 / EP / TP |
-| `callbacks.py` | events + `MoELoadStats`, `PerExpertLR`, `ExpertStats`, console, wandb | measure or intervene between steps |
+| `callbacks.py` | events + `MoELoadStats`, `PerExpertLR`, `ExpertAccumulation`, `ExpertStats`, console, wandb | measure or intervene between steps |
 | `trainer.py` | the loop (~100 lines, nothing MoE-specific) | rarely — add an event instead |
 | `checkpoint.py` | model + optimizers + data position + RNG + callback state | — |
 | `data.py` | `stream` (repo-root `data.py`, unchanged), `disk` (pre-tokenized cache) or `synthetic` | add a data source |
@@ -220,9 +221,10 @@ Checkpoints are `moestack-v1` files (not HF state dicts). For `eval_downstream.p
 | `test_moe.py` | MoE = naive per-token definition; grouped_mm = loop (fwd + bwd); dispatch conserves tokens; combine with identity experts; permutation equivariance; every parameter receives gradient |
 | `test_losses_and_optim.py` | balance loss = 1 when balanced, ≈E when collapsed; batched Muon = `torch.optim.Muon` per slice (incl. zero-grad expert); role → optimizer table; LR curve = original `get_lr` |
 | `test_training.py` | overfit one batch; grad accumulation = full batch (per-token terms); activation checkpointing is transparent and does not double-count routing; trainer end to end; **resume = uninterrupted run, bit for bit**; EP>1 fails loudly; compile = eager |
-| `test_ddp.py` | 2-process gloo: DDP grads = single-process full-batch grads; replicas stay identical; expert counts are summed over ranks; per-expert multipliers and EMA are byte-identical on every rank |
+| `test_ddp.py` | 2-process gloo: DDP grads = single-process full-batch grads; replicas stay identical; expert counts are summed over ranks; per-expert multipliers and EMA are byte-identical on every rank; a never-cleared gradient still accumulates through the reducer's bucket, and zeroing one expert's slice leaves the rest of it alone |
 | `test_per_expert_lr.py` | the LR rule vs the original `compute_lr_scales`; `lr_scale` in Muon = per-expert LRs; alpha=0 and splitting groups change nothing bit-for-bit; config validation and run names; resume keeps a warm EMA |
 | `test_stats.py` | gini decomposition, Spearman tie handling and NaN, per-layer series, the JSONL's shape and cadence |
+| `test_expert_accum.py` | the window rule (threshold, timeout, dead experts, overshoot); Muon's `update_mask` incl. an all-true mask being bit-identical to none; the trainer's new events and accumulator handling; both clocks end to end, and that they agree bit-for-bit at `grad_accum=1` |
 
 Not covered here (needs a GPU): bf16 autocast numerics, CUDA `grouped_mm`, NCCL. First
 thing to run on the cluster: a short `deepseek-tiny` run next to an `imbalance_train.py`
@@ -274,6 +276,123 @@ fails with a message naming the cause.
 Scope: expert FFN weights only. Per-expert rates on the matching router row
 (AdamW, not Muon) are a second rule, deliberately not included.
 
+## Expert-local gradient accumulation
+
+Fix the **token budget** per update instead of the clock. The baseline gives every
+expert one update per step, built from whatever the router sent it: a big-batch
+estimate for a hot expert, a handful of tokens for a cold one, and for a dead one a
+full-magnitude step on renormalised stale momentum (`RESULTS.md` §8). Here an
+expert keeps its gradient until about `threshold` tokens have reached it, then
+updates once and resets — so every update rests on roughly the same number of
+tokens, and hot experts simply update more often.
+
+Off by default, and `enabled=false` leaves every path exactly as it was.
+
+```bash
+# step clock: updates still land on step boundaries, just not every step
+python -m moestack.train loss.aux_coef=0 optim.expert_accum.enabled=true \
+    optim.expert_accum.threshold_rel=4 optim.expert_accum.max_window=16
+
+# micro-batch clock: an expert fires the moment its budget is met
+python -m moestack.train loss.aux_coef=0 optim.expert_accum.enabled=true \
+    optim.expert_accum.clock=microbatch \
+    optim.expert_accum.threshold=196608 optim.expert_accum.max_window=256
+
+# the control that is not accumulation: only skip the zero-token experts
+python -m moestack.train loss.aux_coef=0 optim.expert_accum.enabled=true \
+    optim.expert_accum.threshold=1 optim.expert_accum.max_window=1
+
+bash moestack/submit_expert_accum.sh --dry        # the 10-cell grid
+```
+
+| Field | Meaning |
+|---|---|
+| `clock` | `step` (decide once per optimizer step) or `microbatch` (decide after every backward, so an expert can update several times per batch) |
+| `threshold` | Q, in routed tokens |
+| `threshold_rel` | Q as a multiple of a balanced expert's load **per tick** — the setting that transfers across scales. At `16×16×2048` with 64 experts and top-6 a balanced expert sees 49,152 tokens per step and 3,072 per micro-batch |
+| `max_window` | D, the staleness cap, in ticks. With no threshold at all, D alone closes windows (the fixed-window variant) |
+| `grad_scale` | `mean` divides an event by the tokens it was built from; `sum` does not |
+
+### How it is wired
+
+1. **`p.grad` is the window.** The callback registers the expert tensors in
+   `trainer.grad_accumulators`, and the trainer stops clearing them between batches
+   and leaves them out of `clip_grad_norm_`. So accumulation costs **no extra
+   memory** — and clipping an accumulator would not clip a gradient, it would
+   shrink a half-filled window by a different factor each step.
+2. **`expert_accum.AccumState`** — pure `[L, E]` bookkeeping, decides who fires from
+   the same counts the load statistics read.
+3. **`Muon` groups carry an `update_mask`** (bool `[E]`). A False slice is skipped
+   entirely: no step, no decay, **and no momentum update**. That last part is the
+   whole difference from `lr_scale=0`, where the buffer keeps lerping toward the
+   zeros an idle expert sees. The masked path gathers the firing slices with
+   `index_select`, so a step costs what fires rather than what exists, and an
+   all-true mask is bit-identical to no mask.
+4. **`Optimizers.step(only="expert")`** lets a mid-batch event move the experts
+   while the shared parameters keep the gradient they are still accumulating.
+
+### Rules that are easy to get wrong
+
+- **A window ages from its first token**, not from the last event, so an expert
+  quiet for fifty ticks is not fired by the timeout the instant one token arrives.
+- **An expert with no tokens never fires** — threshold, timeout or flush.
+- **The gradient is divided by the tokens it was built from.** Under Muon the
+  overall scale washes out in Newton-Schulz, so this is not about step size: it is
+  about `buf.lerp_(grad, 1 - mom)`, which otherwise lets a long window dominate the
+  momentum buffer purely by being long.
+- **Momentum runs in event time.** An expert firing every fiftieth tick decays its
+  buffer once per event. Intended — each expert has its own clock — but a real
+  difference from the baseline.
+- **A dropped batch throws away every window.** Its gradient is already in every
+  accumulator and cannot be subtracted back out. On the micro-batch clock a
+  non-finite micro-batch additionally fires nothing, because an expert that has
+  stepped cannot be un-stepped.
+- **The final flush is not a nicety.** Without it, every expert's last partial
+  window is discarded; with a budget larger than a short run ever reaches, that is
+  the entire run.
+
+### Limits
+
+**Not resumable.** The open windows live in the gradient buffers, which
+`checkpoint.py` does not write, so `train.resume` / `train.auto_resume` are refused
+at startup rather than restoring token counts without the gradients they stand for.
+
+**`clock=microbatch` is single-process.** The trainer runs all but the last
+micro-batch under `no_sync`, so mid-batch an expert's gradient is one rank's alone
+and the replicas would diverge silently. Syncing every micro-batch is *correct* —
+`test_ddp.py` pins that a never-cleared gradient accumulates properly through the
+reducer's bucket — but costs `grad_accum×` the communication, so it is a choice to
+make rather than a default. `clock=step` works under DDP unchanged. Expert
+parallelism is where this idea actually belongs: each expert's gradient from every
+rank's tokens already arrives at its owner through the backward all-to-all, so the
+owner can decide and update locally with no extra collective.
+
+**Mutually exclusive with `optim.per_expert_lr`.** They compose fine inside Muon
+(mask × multiplier, tested), but the LR rule is keyed on *this step's* token share
+while an accumulated update represents a whole window — so the multiplier would be
+scaling an update it does not describe. The composition that makes sense is a
+per-*event* rule, reading the window's token count at the moment it fires.
+
+### What to watch
+
+`accum/events_per_expert` is the one number that says what the clock is doing: 1.0
+is the baseline's cadence, 3.0 means experts update three times as often, 0.2 means
+a window spans five steps. Then `accum/tokens_per_event_{mean,min,max}` (should
+concentrate just above Q), `accum/overshoot_mean`, `accum/timeout_fraction` (high
+means Q is out of range and the windows are really fixed-length),
+`accum/waiting_fraction`, `accum/age_max`, `accum/never_fired_fraction` and
+`accum/discarded_windows`.
+
+`accum/event_gini` is the tripwire. The scheme can feed a loop: a hot expert
+crosses its budget more often, takes more steps, improves, and the router sends it
+still more. Read it next to `load/gini` — if update inequality runs away while
+routing inequality does not, the extra *steps* are doing it.
+
+`logging.accum_events_every=N` writes `<save_dir>/<run_name>_accum_events.jsonl`:
+one record per tick that fired anything, with the full `[L, E]` picture of tokens
+per event, which rule closed each window, and what is still pending. The cadence
+lives in `logging`, so it never changes a run's name.
+
 ## Measurement
 
 `MoELoadStats` runs every step from the exact global counts and emits eight
@@ -317,7 +436,10 @@ The cadence lives in `logging`, so it never changes a run's name or fingerprint.
 - **Expert parallelism**: an `AllToAllDispatcher` implementing `dispatch`/`combine`,
   `GroupedExperts(n_local_experts=E/ep)`, and expert grads reduced over `edp` only.
   Test: EP=2 matches EP=1 on loss and grads.
-- **Experiments** (expert-local accumulation, tying): new `Rule`s, group attributes, or
-  a callback/step policy — not edits to `trainer.py`. Per-expert LR, above, is the
-  worked example: a `Rule` flag, a group attribute and one callback, with `trainer.py`
-  changed by two lines that only decide whether to build them.
+- **Experiments** (tying, routing rules): new `Rule`s, group attributes, or a
+  callback/step policy — not edits to `trainer.py`. Per-expert LR and expert-local
+  accumulation, above, are the two worked examples: a group attribute, a pure rule
+  module and one callback each. Accumulation is the larger of the two and still
+  added only three callback events to `trainer.py`, plus one list of parameters
+  whose gradient it must not clear or clip — the trainer never learns what the
+  accumulation rule is.

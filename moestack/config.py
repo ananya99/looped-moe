@@ -246,6 +246,11 @@ class LoggingConfig:
     # correlations derived from them. 0 = off. Measurement cadence only: it is in
     # the `logging` section, so it never changes a run's name or fingerprint.
     expert_stats_every: int = 0
+    # Steps between records in <save_dir>/<run_name>_accum_events.jsonl: for each
+    # tick on which something fired, the full [L, E] picture of which experts
+    # closed a window, on how many tokens, by which rule, and what is still
+    # waiting. The dashboard gets only the accum/* aggregates. 0 = off.
+    accum_events_every: int = 0
 
 
 # Fields that cannot change what a run learns, and so must not change its name.

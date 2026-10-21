@@ -267,12 +267,16 @@ class ExpertAccumulation(Callback):
     rather than restoring token counts without the gradients they stand for.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, every: int = 0, path=None):
         self.cfg = cfg
         self.state, self.threshold, self.experts = None, None, []
         self._fired, self._accepted, self._off = None, False, None
         self.tally = None
         self.discarded, self.nonfinite_micro = 0, 0
+        # Per-event records. Per-expert series are far too wide for wandb, so the
+        # joint distribution goes to a file on a cadence and the dashboard gets
+        # the aggregates -- the same split as ExpertStats.
+        self.every, self.path, self._fh, self._main = every, path, None, True
 
     # -- setup ---------------------------------------------------------
     def on_train_start(self, trainer):
@@ -292,6 +296,9 @@ class ExpertAccumulation(Callback):
             raise RuntimeError("ExpertAccumulation: no per-layer expert param groups -- "
                                "build_optimizers(..., split_experts=True) is required")
         args = trainer.args
+        self._main = trainer.dist.is_main
+        if self.every > 0 and self.path is None:
+            self.path = Path(trainer.save_dir) / f"{trainer.run_name}_accum_events.jsonl"
         self.experts = [(m.experts.gate_up_proj, m.experts.down_proj)
                         for m in trainer.model.moe_layers()]
         trainer.grad_accumulators.extend(p for pair in self.experts for p in pair)
@@ -321,7 +328,7 @@ class ExpertAccumulation(Callback):
             # and `on_step_end` discards the windows.
             self.nonfinite_micro += 1
             return
-        event = self._close_windows(trainer, counts, state.step)
+        event = self._close_windows(trainer, counts, state.step, tick=micro_step)
         if not event.any:
             return
         # Only the experts: the shared parameters are still filling their own
@@ -366,21 +373,50 @@ class ExpertAccumulation(Callback):
         event = self.state.flush()
         if not event.any:
             return False
-        self._arm(trainer, event, self.state.consume(event.fire, trainer.step))
+        tokens = self.state.consume(event.fire, trainer.step)
+        self.tally.add(event, tokens)
+        self._arm(trainer, event, tokens)
+        self._record(trainer.step, 0, event, tokens, reason="flush")
         trainer.optimizers.step(only="expert")
         self._zero(event.fire)
         trainer.optimizers.set_expert_update_mask(None)
         return True
 
     # -- plumbing ------------------------------------------------------
-    def _close_windows(self, trainer, counts, step):
+    def _close_windows(self, trainer, counts, step, tick=0):
         """observe -> decide -> consume -> arm the optimizer. Returns the event."""
         self.state.observe(counts)
         event = self.state.ready(self.threshold, self.cfg.max_window)
         tokens = self.state.consume(event.fire, step)
         self.tally.add(event, tokens)
         self._arm(trainer, event, tokens)
+        self._record(step, tick, event, tokens)
         return event
+
+    def _record(self, step, tick, event, tokens, reason="rule"):
+        """One line per tick that fired anything, on the configured cadence."""
+        if not (self._main and self.every > 0 and event.any
+                and step % self.every == 0):
+            return
+        if self._fh is None:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self._fh = Path(self.path).open("a")
+        self._fh.write(json.dumps({
+            "step": step, "tick": tick, "clock": self.cfg.clock, "reason": reason,
+            "threshold": self.threshold,
+            # tokens is 0 wherever nothing fired, so it carries the mask too.
+            "tokens": tokens.tolist(),
+            "by_timeout": event.by_timeout.to(torch.int8).tolist(),
+            "pending": self.state.pending.tolist(),
+            "age": self.state.age.tolist(),
+            "events": self.state.events.tolist(),
+        }) + "\n")
+        self._fh.flush()        # a killed job keeps every record it already wrote
+
+    def on_train_end(self, trainer, state):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
 
     def _arm(self, trainer, event, tokens):
         """Scale the firing gradients, and gate the optimizer to those slices."""

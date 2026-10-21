@@ -62,7 +62,8 @@ class Trainer:
         if cfg.optim.per_expert_lr.enabled:
             cbs.append(PerExpertLR(cfg.optim.per_expert_lr))
         if cfg.optim.expert_accum.enabled:
-            cbs.append(ExpertAccumulation(cfg.optim.expert_accum))
+            cbs.append(ExpertAccumulation(cfg.optim.expert_accum,
+                                          cfg.logging.accum_events_every))
         if cfg.logging.expert_stats_every:
             cbs.append(ExpertStats(cfg.logging.expert_stats_every))
         cbs += list(callbacks or [])

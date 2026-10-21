@@ -7,6 +7,7 @@ accumulation window must be left *completely* alone -- weights, decay and moment
 """
 
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -229,8 +230,9 @@ def test_stepping_only_the_experts_leaves_the_rest_of_the_model_and_its_grads_al
 # Stage 2: the window controller (moestack/expert_accum.py)
 # ──────────────────────────────────────────────────────────────────────
 
-from moestack.expert_accum import (AccumState, accum_metrics, grad_scale,        # noqa: E402
-                                   mean_tokens_per_expert, resolve_threshold)
+from moestack.expert_accum import (AccumState, EventTally, accum_metrics,        # noqa: E402
+                                   grad_scale, mean_tokens_per_expert,
+                                   resolve_threshold)
 
 
 def _state(*rows):
@@ -463,13 +465,19 @@ def test_an_ill_defined_threshold_is_an_error(kw, match):
 
 # ── metrics ──────────────────────────────────────────────────────────
 
+def _tally(state, event, tokens):
+    t = EventTally(state.pending.numel())
+    t.add(event, tokens)
+    return t
+
+
 def test_metrics_report_the_realised_budget_and_what_is_still_waiting():
     s = AccumState.zeros(1, 4)
     s.observe(_counts([12, 11, 3, 0]))
     ev = s.ready(threshold=10, max_window=None)
     tokens = s.consume(ev.fire, step=0)
-    m = accum_metrics(s, ev, tokens, threshold=10)
-    assert m["accum/event_fraction"] == 0.5
+    m = accum_metrics(s, _tally(s, ev, tokens), threshold=10)
+    assert m["accum/events_per_expert"] == 0.5
     assert m["accum/waiting_fraction"] == 0.25        # the expert sitting on 3
     assert m["accum/never_fired_fraction"] == 0.5
     assert m["accum/tokens_per_event_mean"] == 11.5
@@ -482,7 +490,7 @@ def test_metrics_separate_a_timeout_from_a_met_budget():
     s.observe(_counts([50, 1]))
     s.age += 4
     ev = s.ready(threshold=10, max_window=4)
-    m = accum_metrics(s, ev, s.consume(ev.fire, 0), threshold=10)
+    m = accum_metrics(s, _tally(s, ev, s.consume(ev.fire, 0)), threshold=10)
     assert m["accum/timeout_fraction"] == 0.5
 
 
@@ -490,8 +498,8 @@ def test_metrics_are_finite_when_nothing_fires():
     s = AccumState.zeros(1, 2)
     s.observe(_counts([1, 1]))
     ev = s.ready(threshold=10, max_window=None)
-    m = accum_metrics(s, ev, s.consume(ev.fire, 0), threshold=10)
-    assert m["accum/event_fraction"] == 0.0
+    m = accum_metrics(s, _tally(s, ev, s.consume(ev.fire, 0)), threshold=10)
+    assert m["accum/events_per_expert"] == 0.0
     assert all(not math.isnan(v) for v in m.values())
     assert "accum/tokens_per_event_mean" not in m
 
@@ -500,7 +508,7 @@ def test_metrics_are_finite_when_nothing_fires():
 # Stage 3: the trainer's seams (moestack/trainer.py, moestack/callbacks.py)
 # ──────────────────────────────────────────────────────────────────────
 
-from moestack.callbacks import Callback                          # noqa: E402
+from moestack.callbacks import Callback, StepState               # noqa: E402
 from moestack.trainer import Trainer                             # noqa: E402
 
 from conftest import tiny_config                                 # noqa: E402
@@ -512,7 +520,7 @@ class _Recorder(Callback):
     def __init__(self, flush_moved=False):
         self.log, self.flush_moved = [], flush_moved
 
-    def on_microbatch_end(self, trainer, state, micro_step, counts):
+    def on_microbatch_end(self, trainer, state, micro_step, counts, loss):
         self.log.append(("micro", state.step, micro_step, tuple(counts.shape)))
 
     def on_before_optimizer_step(self, trainer, state):
@@ -555,7 +563,7 @@ def test_the_microbatch_event_carries_that_microbatchs_own_counts(tmp_path):
     seen = []
 
     class Watch(Callback):
-        def on_microbatch_end(self, trainer, state, micro_step, counts):
+        def on_microbatch_end(self, trainer, state, micro_step, counts, loss):
             seen.append(counts.clone())
 
         def on_step_end(self, trainer, state):
@@ -575,7 +583,7 @@ class _Poisoner(Callback):
     def __init__(self, at_step):
         self.at_step = at_step
 
-    def on_microbatch_end(self, trainer, state, micro_step, counts):
+    def on_microbatch_end(self, trainer, state, micro_step, counts, loss):
         if state.step == self.at_step and micro_step == trainer.cfg.data.grad_accum - 1:
             next(iter(trainer.model.parameters())).grad.fill_(float("inf"))
 
@@ -622,7 +630,7 @@ class _Registers(Callback):
         if self.register:
             trainer.grad_accumulators.append(self.p)
 
-    def on_microbatch_end(self, trainer, state, micro_step, counts):
+    def on_microbatch_end(self, trainer, state, micro_step, counts, loss):
         if micro_step == trainer.cfg.data.grad_accum - 1:
             self.p.grad.add_(self.spike)
 
@@ -874,8 +882,129 @@ def test_accumulation_and_per_expert_lr_cannot_both_be_on():
         cfg.__post_init__()
 
 
-def test_the_microbatch_clock_says_it_is_not_ready_yet(tmp_path):
+def test_counting_several_events_for_one_expert_keeps_the_rate_above_one():
+    """What tells the two clocks apart: on the micro-batch clock an expert can fire
+    more than once in a step, and `events_per_expert` is where that shows up."""
+    s = AccumState.zeros(1, 2)
+    t = EventTally(2)
+    for _ in range(3):
+        s.observe(_counts([10, 0]))
+        ev = s.ready(threshold=10, max_window=None)
+        t.add(ev, s.consume(ev.fire, 0))
+    m = accum_metrics(s, t, threshold=10)
+    assert m["accum/events_per_expert"] == 1.5           # 3 events over 2 experts
+    assert m["accum/tokens_per_event_mean"] == 10.0
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Stage 5: the micro-batch clock -- experts stop waiting for the batch
+# ──────────────────────────────────────────────────────────────────────
+
+def test_the_microbatch_clock_lets_an_expert_update_several_times_in_one_batch(tmp_path):
+    """The whole difference from the step clock. At a budget an average expert
+    meets every micro-batch, `events_per_expert` climbs towards grad_accum instead
+    of sitting at the baseline's 1.0."""
+    seen = []
+
+    class Rate(Callback):
+        def on_step_end(self, trainer, state):
+            seen.append(state.metrics["accum/events_per_expert"])
+
+    t = _accum_fit(tmp_path, Rate(), steps=3, threshold=1, max_window=1,
+                   clock="microbatch")
+    assert max(seen) > 1.0
+    assert max(seen) <= t.cfg.data.grad_accum
+
+
+def test_the_two_clocks_agree_when_a_batch_is_a_single_microbatch(tmp_path):
+    """With grad_accum=1 a tick is a tick either way, so the clocks are the same
+    experiment -- and must produce the same weights."""
+    out = {}
+    for clock in ("step", "microbatch"):
+        cfg = _accum_cfg(tmp_path / clock, steps=4, threshold=50, max_window=4,
+                         clock=clock)
+        cfg.data.grad_accum = 1
+        t = Trainer(cfg, verbose=False)
+        t.fit()
+        out[clock] = _expert_weights(t)
+    torch.testing.assert_close(out["step"], out["microbatch"], atol=0, rtol=0)
+
+
+def test_the_batch_step_does_not_step_the_experts_a_second_time(tmp_path):
+    """Everything an expert does on this clock happens inside the loop. Without an
+    all-off mask at the step, Muon would step whatever fired last a second time --
+    on its freshly zeroed gradient, i.e. on renormalised stale momentum."""
+    seen = []
+
+    class MaskAtStep(Callback):
+        def on_accepted_step(self, trainer, state):
+            groups = trainer.optimizers.expert_lr_groups()
+            seen.append(torch.stack([g[0]["update_mask"]
+                                     for _, g in sorted(groups.items())]).clone())
+
+    _accum_fit(tmp_path, MaskAtStep(), steps=3, threshold=1, max_window=1,
+               clock="microbatch")
+    assert seen and all(not m.any() for m in seen)
+
+
+def test_a_waiting_expert_is_still_untouched_on_the_microbatch_clock(tmp_path):
+    w = _Watch()
+    t = _accum_fit(tmp_path, w, steps=3, threshold=10**9, clock="microbatch")
+    for _, _, _, weights in w.rows:
+        assert torch.equal(weights, w.start)
+    assert not torch.equal(_expert_weights(t), w.start)      # ... until the flush
+
+
+def test_a_nonfinite_microbatch_fires_nothing(tmp_path):
+    """An expert that has stepped cannot be un-stepped, so a bad micro-batch must
+    not be allowed to close a window. The batch is dropped at the step boundary
+    and the windows are discarded there instead."""
+    cfg = _accum_cfg(tmp_path, steps=1, threshold=1, max_window=1, clock="microbatch")
+    t = Trainer(cfg, verbose=False)
+    t.callbacks.on_train_start(t)
+    acc = next(c for c in t.callbacks.callbacks if isinstance(c, ExpertAccumulation))
+    t.train_step()                                   # real grads, real events
+
+    before = acc.state.events.clone()
+    counts = torch.ones_like(acc.state.pending)
+    acc.on_microbatch_end(t, StepState(step=1), 0, counts, torch.tensor(float("inf")))
+    assert acc.nonfinite_micro == 1
+    assert torch.equal(acc.state.events, before)     # nothing fired
+    assert acc.state.pending.sum() == 0              # ... and nothing was observed
+
+
+def test_the_microbatch_clock_refuses_to_run_under_ddp(tmp_path):
+    """Mid-batch an expert's gradient is this rank's alone (the trainer runs all
+    but the last micro-batch under no_sync), so the replicas would silently take
+    different steps."""
     t = Trainer(_accum_cfg(tmp_path, steps=1, threshold=100, clock="microbatch"),
                 verbose=False)
-    with pytest.raises(NotImplementedError, match="not wired up yet"):
-        t.fit()
+    t.dist.world_size = 2
+    with pytest.raises(NotImplementedError, match="single-process for now"):
+        t.callbacks.on_train_start(t)
+
+
+def test_the_step_clock_is_still_allowed_under_ddp(tmp_path):
+    t = Trainer(_accum_cfg(tmp_path, steps=1, threshold=100, clock="step"), verbose=False)
+    t.dist.world_size = 2
+    t.callbacks.on_train_start(t)                    # does not raise
+
+
+def test_the_microbatch_clocks_budget_is_read_per_microbatch(tmp_path):
+    """threshold_rel means 'this many ticks of a balanced expert's load', and a
+    tick is a micro-batch here -- so the same setting is grad_accum times smaller
+    than on the step clock. The two cells are only comparable at a fixed Q."""
+    per_clock = {}
+    for clock in ("step", "microbatch"):
+        t = Trainer(_accum_cfg(tmp_path / clock, steps=1, threshold_rel=2.0, clock=clock),
+                    verbose=False)
+        t.callbacks.on_train_start(t)
+        acc = next(c for c in t.callbacks.callbacks if isinstance(c, ExpertAccumulation))
+        per_clock[clock] = acc.threshold
+    assert per_clock["step"] == per_clock["microbatch"] * 2      # tiny_config: accum=2
+
+
+def test_the_two_clocks_get_different_names():
+    a = _accum_cfg(Path("/tmp"), threshold=512, max_window=8, clock="step").run_name()
+    b = _accum_cfg(Path("/tmp"), threshold=512, max_window=8, clock="microbatch").run_name()
+    assert "accst" in a and "accmb" in b and a != b

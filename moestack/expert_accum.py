@@ -227,22 +227,49 @@ def grad_scale(tokens: torch.Tensor, fire: torch.Tensor, mode: str = "mean") -> 
     return torch.where(fire, 1.0 / safe, ones)
 
 
-def accum_metrics(state: AccumState, event: Event, tokens: torch.Tensor,
-                  threshold: int | None) -> dict:
-    """Aggregates for wandb, read *after* `consume`: `tokens` is what the events
-    were built from, while `state` is what is still waiting.
+class EventTally:
+    """Everything that fired during one step, so both clocks report one set of
+    numbers.
+
+    On the step clock an expert fires at most once per step and this holds a
+    single event. On the micro-batch clock it may fire several times, which is the
+    whole point -- and `events_per_expert` is the number that says so: 1.0 is the
+    baseline's one update per expert per step, 3.0 means experts are updating three
+    times as often, 0.2 means a window spans five steps on average.
+    """
+
+    def __init__(self, n_slots: int):
+        self.slots = n_slots                # layers x experts
+        self.events = self.timeouts = 0
+        self.token_sum = 0.0
+        self.token_min, self.token_max = float("inf"), 0.0
+
+    def add(self, event: Event, tokens: torch.Tensor) -> None:
+        n = int(event.fire.sum())
+        if not n:
+            return
+        fired = tokens[event.fire].to(torch.float32)
+        self.events += n
+        self.timeouts += int(event.by_timeout.sum())
+        self.token_sum += float(fired.sum())
+        self.token_min = min(self.token_min, float(fired.min()))
+        self.token_max = max(self.token_max, float(fired.max()))
+
+
+def accum_metrics(state: AccumState, tally: EventTally, threshold: int | None) -> dict:
+    """Aggregates for wandb, read at the end of a step: `tally` is what fired
+    during it, `state` is what is still waiting.
 
     Per-expert series are far too wide to log (64 experts x 16 layers), so the
     dashboard gets these and the joint distribution goes to the JSONL -- the same
     division of labour as `expert_lr.scale_summary`.
     """
     nan = float("nan")
-    fire, n_fired = event.fire, int(event.fire.sum())
-    fired_tokens = tokens[fire].to(torch.float32) if n_fired else tokens.new_zeros(0).float()
     pending, age = state.pending.float(), state.age.float()
     out = {
-        # Updates per expert per tick: 1.0 is the baseline's "everyone, every step".
-        "accum/event_fraction": float(fire.to(torch.float32).mean()),
+        # Updates per expert per step. 1.0 is the baseline's cadence, and the
+        # single number that says what the clock is actually doing.
+        "accum/events_per_expert": tally.events / max(tally.slots, 1),
         "accum/waiting_fraction": float((state.pending > 0).to(torch.float32).mean()),
         "accum/never_fired_fraction": float((state.events == 0).to(torch.float32).mean()),
         "accum/pending_mean": float(pending.mean()),
@@ -251,19 +278,19 @@ def accum_metrics(state: AccumState, event: Event, tokens: torch.Tensor,
         # not the token budget -- is what is driving the experiment.
         "accum/age_max": float(age.max()) if age.numel() else nan,
     }
-    if n_fired:
+    if tally.events:
         out.update({
-            "accum/tokens_per_event_mean": float(fired_tokens.mean()),
-            "accum/tokens_per_event_min": float(fired_tokens.min()),
-            "accum/tokens_per_event_max": float(fired_tokens.max()),
+            "accum/tokens_per_event_mean": tally.token_sum / tally.events,
+            "accum/tokens_per_event_min": tally.token_min,
+            "accum/tokens_per_event_max": tally.token_max,
             # Of the events that happened, how many were the timeout giving up
             # rather than the budget being met. A high number means Q is out of
             # range for this run and the windows are really fixed-length.
-            "accum/timeout_fraction": float(event.by_timeout.to(torch.float32).sum() / n_fired),
+            "accum/timeout_fraction": tally.timeouts / tally.events,
         })
         if threshold:
             # How far past Q a window lands, because a single tick can carry an
             # expert well over the line. Far above 1.0 means the tick is too coarse
             # for the budget being asked for.
-            out["accum/overshoot_mean"] = float(fired_tokens.mean() / threshold)
+            out["accum/overshoot_mean"] = out["accum/tokens_per_event_mean"] / threshold
     return out

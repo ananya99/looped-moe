@@ -6,7 +6,7 @@ stateful; their `state_dict` goes into the checkpoint.
 
 Events (in order within a step):
     on_train_start(trainer)
-    on_microbatch_end(trainer, state, i, counts)   after each micro-batch's backward
+    on_microbatch_end(trainer, state, i, counts, loss)   after each backward
     on_before_optimizer_step(trainer, state)   grads are final (reduced + clipped)
     on_accepted_step(trainer, state)           ... and the step was not dropped
     on_step_end(trainer, state)                params updated
@@ -14,8 +14,10 @@ Events (in order within a step):
     on_before_final_eval(trainer, state)       -> bool: "did you move the weights?"
     on_train_end(trainer, state)
 
-`on_microbatch_end` carries that micro-batch's *rank-local* `[L, E]` counts; only
-`state.expert_counts` is reduced over the global batch. `on_accepted_step` is
+`on_microbatch_end` carries that micro-batch's *rank-local* `[L, E]` counts and
+its detached loss; only `state.expert_counts` is reduced over the global batch.
+The loss is handed over rather than checked by the trainer because reading it
+costs a device sync, and only a callback that acts mid-batch needs to pay for it. `on_accepted_step` is
 `on_before_optimizer_step` minus the steps the trainer drops for a non-finite loss
 or gradient norm -- anything that changes weights or consumes accumulated state
 belongs there, because a dropped batch must leave both untouched.
@@ -31,7 +33,8 @@ from pathlib import Path
 
 import torch
 
-from .expert_accum import AccumState, accum_metrics, grad_scale, resolve_threshold
+from .expert_accum import (AccumState, EventTally, accum_metrics, grad_scale,
+                           resolve_threshold)
 from .expert_lr import ema_update, lr_scales_from_counts, scale_summary
 from .stats import delta_norms, drift_metrics, gini, load_metrics, row_norms
 
@@ -50,7 +53,7 @@ class StepState:
 class Callback:
     def on_train_start(self, trainer): ...
     def on_microbatch_end(self, trainer, state: StepState, micro_step: int,
-                          counts: torch.Tensor): ...
+                          counts: torch.Tensor, loss: torch.Tensor): ...
     def on_before_optimizer_step(self, trainer, state: StepState): ...
     def on_accepted_step(self, trainer, state: StepState): ...
     def on_step_end(self, trainer, state: StepState): ...
@@ -70,7 +73,7 @@ class CallbackList(Callback):
             getattr(cb, name)(*args)
 
     def on_train_start(self, t): self._fire("on_train_start", t)
-    def on_microbatch_end(self, t, s, i, c): self._fire("on_microbatch_end", t, s, i, c)
+    def on_microbatch_end(self, t, s, i, c, l): self._fire("on_microbatch_end", t, s, i, c, l)
     def on_before_optimizer_step(self, t, s): self._fire("on_before_optimizer_step", t, s)
     def on_accepted_step(self, t, s): self._fire("on_accepted_step", t, s)
     def on_step_end(self, t, s): self._fire("on_step_end", t, s)
@@ -223,25 +226,41 @@ class ExpertAccumulation(Callback):
     1. `p.grad` *is* the window. Registering the expert tensors in
        `trainer.grad_accumulators` is what stops the trainer clearing them between
        batches and clipping them -- so accumulation costs no extra memory.
-    2. `expert_accum.AccumState` decides who fires, from the same all-reduced
-       `[L, E]` counts the load statistics read. Identical counts on every rank
-       mean identical decisions, with no extra collective.
+    2. `expert_accum.AccumState` decides who fires, from the `[L, E]` counts the
+       model already returns. On the step clock those are all-reduced, so every
+       rank decides identically with no extra collective.
     3. The firing slices' gradients are divided by the tokens they were built from
        and the rest are left alone, then `Optimizers.set_expert_update_mask` gates
        Muon so only those slices step -- weights, decay *and* momentum.
     4. Once the optimizer has stepped, those slices' gradients are zeroed; every
        other window carries on filling.
 
-    Two cases that are easy to miss:
+    Two clocks, one rule. `clock="step"` keeps updates at step boundaries and just
+    skips the steps where a window is not full. `clock="microbatch"` lets an expert
+    fire the moment its budget is met, several times within a step if it is hot --
+    the global batch stops being the unit of time for experts, while the shared
+    parameters keep stepping once per batch as usual. On that clock the shared
+    gradient for one step is therefore computed against several versions of the
+    experts; that is the trade the idea is making, and
+    `accum/events_per_expert` is the number that says how far it is being pushed.
+
+    Three cases that are easy to miss:
 
     - A batch the trainer **drops** as non-finite has already added its gradient to
       every open window, and it cannot be subtracted back out. So a dropped batch
       throws away every window rather than carrying a poisoned one -- which is also
-      why the work happens on `on_accepted_step` and not `on_before_optimizer_step`.
+      why the step-clock work happens on `on_accepted_step` and not on
+      `on_before_optimizer_step`. On the micro-batch clock a non-finite micro-batch
+      fires nothing, because an expert that has already stepped cannot be
+      un-stepped; the step-level drop then clears the windows as usual.
     - The **final flush** closes whatever is still open before the run's last eval
       and save, or the last partial window of every expert is silently discarded.
       Only the experts step there; the shared parameters finished with the last
       batch.
+    - **Momentum runs in event time.** An expert that fires every fiftieth tick
+      decays its buffer once per event, not once per tick. That is the intended
+      reading -- each expert has its own clock -- but it is a real difference from
+      the baseline, not an implementation detail.
 
     Not resumable, deliberately: the open windows are in the gradient buffers,
     which `checkpoint.py` does not write. `config.py` refuses the combination
@@ -251,16 +270,24 @@ class ExpertAccumulation(Callback):
     def __init__(self, cfg):
         self.cfg = cfg
         self.state, self.threshold, self.experts = None, None, []
-        self._fired, self._metrics, self._accepted = None, {}, False
-        self.discarded = 0
+        self._fired, self._accepted, self._off = None, False, None
+        self.tally = None
+        self.discarded, self.nonfinite_micro = 0, 0
 
     # -- setup ---------------------------------------------------------
     def on_train_start(self, trainer):
-        if self.cfg.clock != "step":
+        if self.cfg.clock == "microbatch" and trainer.dist.world_size > 1:
+            # The trainer runs every micro-batch but the last under `no_sync`, so
+            # mid-batch an expert's gradient is this rank's alone and the replicas
+            # would take different steps with nothing raising. Syncing every
+            # micro-batch is correct (tests/test_ddp.py pins that) but costs
+            # grad_accum times the communication, so it is a deliberate choice
+            # rather than a silent default.
             raise NotImplementedError(
-                f"optim.expert_accum.clock={self.cfg.clock!r} is not wired up yet: "
-                "the event-driven clock also needs a per-micro-batch finite check, "
-                "because an expert that fires mid-batch cannot be un-stepped")
+                f"optim.expert_accum.clock=microbatch is single-process for now, got "
+                f"world_size={trainer.dist.world_size}: firing an expert mid-batch "
+                f"needs its gradient reduced every micro-batch, not just at the "
+                f"batch boundary. Use clock=step under DDP.")
         if not trainer.optimizers.expert_lr_groups():
             raise RuntimeError("ExpertAccumulation: no per-layer expert param groups -- "
                                "build_optimizers(..., split_experts=True) is required")
@@ -270,7 +297,11 @@ class ExpertAccumulation(Callback):
         trainer.grad_accumulators.extend(p for pair in self.experts for p in pair)
         self.state = AccumState.zeros(args.n_layers, args.n_experts,
                                       device=trainer.dist.device)
-        per_tick = trainer.tokens_per_step      # one tick = one step on this clock
+        self._off = torch.zeros_like(self.state.pending, dtype=torch.bool)
+        self.tally = EventTally(args.n_layers * args.n_experts)
+        per_tick = trainer.tokens_per_step
+        if self.cfg.clock == "microbatch":
+            per_tick //= trainer.cfg.data.grad_accum
         self.threshold = resolve_threshold(self.cfg.threshold, self.cfg.threshold_rel,
                                            per_tick, args.top_k, args.n_experts)
         if trainer.verbose:
@@ -280,35 +311,56 @@ class ExpertAccumulation(Callback):
                   f"({balanced:,.0f} tokens/expert/tick at perfect balance)")
 
     # -- the cycle -----------------------------------------------------
+    def on_microbatch_end(self, trainer, state, micro_step, counts, loss):
+        if self.cfg.clock != "microbatch":
+            return
+        if not bool(torch.isfinite(loss)):
+            # This micro-batch's gradient is already in every open window and
+            # cannot be subtracted out, but an expert that has stepped cannot be
+            # un-stepped either. Fire nothing; the step-level check drops the batch
+            # and `on_step_end` discards the windows.
+            self.nonfinite_micro += 1
+            return
+        event = self._close_windows(trainer, counts, state.step)
+        if not event.any:
+            return
+        # Only the experts: the shared parameters are still filling their own
+        # window and must keep the gradient they have accumulated so far.
+        trainer.optimizers.step(only="expert")
+        self._zero(event.fire)
+
     def on_before_optimizer_step(self, trainer, state):
         self._accepted = False      # until the trainer says otherwise
 
     def on_accepted_step(self, trainer, state):
         self._accepted = True
+        if self.cfg.clock == "microbatch":
+            # Every expert event for this batch already happened inside the loop.
+            # Without an explicit all-off mask the optimizer would step them again,
+            # on the zeroed gradient of whatever fired last.
+            trainer.optimizers.set_expert_update_mask(self._off)
+            return
         if state.expert_counts is None:
             return
-        self.state.observe(state.expert_counts)
-        event = self.state.ready(self.threshold, self.cfg.max_window)
-        tokens = self.state.consume(event.fire, state.step)
-        self._arm(trainer, event, tokens)
-        self._fired = event.fire
-        self._metrics = accum_metrics(self.state, event, tokens, self.threshold)
+        self._fired = self._close_windows(trainer, state.expert_counts,
+                                          state.step).fire
 
     def on_step_end(self, trainer, state):
         if not self._accepted:
             self._zero_every_window()
             self.state.discard()
             self.discarded += 1
-            self._metrics = {}
-            return
-        if self._fired is not None:
-            self._zero(self._fired)
-            self._fired = None
-        self._metrics["accum/discarded_windows"] = self.discarded
-        if self.threshold:
-            self._metrics["accum/threshold"] = self.threshold
-        state.metrics.update(self._metrics)
-        self._metrics = {}
+        else:
+            if self._fired is not None:
+                self._zero(self._fired)     # the step clock steps inside the trainer
+                self._fired = None
+            state.metrics.update(accum_metrics(self.state, self.tally, self.threshold))
+            state.metrics["accum/discarded_windows"] = self.discarded
+            if self.cfg.clock == "microbatch":
+                state.metrics["accum/nonfinite_microbatches"] = self.nonfinite_micro
+            if self.threshold:
+                state.metrics["accum/threshold"] = self.threshold
+        self.tally = EventTally(self.tally.slots)
 
     def on_before_final_eval(self, trainer, state) -> bool:
         event = self.state.flush()
@@ -321,17 +373,30 @@ class ExpertAccumulation(Callback):
         return True
 
     # -- plumbing ------------------------------------------------------
+    def _close_windows(self, trainer, counts, step):
+        """observe -> decide -> consume -> arm the optimizer. Returns the event."""
+        self.state.observe(counts)
+        event = self.state.ready(self.threshold, self.cfg.max_window)
+        tokens = self.state.consume(event.fire, step)
+        self.tally.add(event, tokens)
+        self._arm(trainer, event, tokens)
+        return event
+
     def _arm(self, trainer, event, tokens):
-        """Scale the firing gradients and gate the optimizer to those slices."""
+        """Scale the firing gradients, and gate the optimizer to those slices."""
         if self.cfg.grad_scale != "sum":
             scales = grad_scale(tokens, event.fire, self.cfg.grad_scale)
             for layer, pair in enumerate(self.experts):
-                # Exactly 1.0 off the firing slices, so a window that is still
-                # filling is multiplied by one rather than disturbed.
-                v = scales[layer].view(-1, 1, 1)
+                # Only the firing slices are touched: a window that is still
+                # filling must not be rescaled, and on the micro-batch clock this
+                # runs grad_accum times per step.
+                idx = event.fire[layer].nonzero().flatten()
+                if not idx.numel():
+                    continue
+                v = scales[layer].index_select(0, idx).view(-1, 1, 1)
                 for p in pair:
                     if p.grad is not None:
-                        p.grad.mul_(v)
+                        p.grad.index_copy_(0, idx, p.grad.index_select(0, idx) * v)
         trainer.optimizers.set_expert_update_mask(event.fire)
 
     def _zero(self, fire):

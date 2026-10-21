@@ -146,11 +146,12 @@ class Trainer:
                 sums[t.name] = sums.get(t.name, 0.0) + t.value.detach().float() / accum
             sums["total"] = sums.get("total", 0.0) + loss.detach().float() / accum
             micro_counts = torch.stack([r.counts for r in out.router_outs])
+            micro_loss = loss.detach()
             counts += micro_counts
             del out, terms, loss, inp, tgt  # free the memory before the all_reduce
             # Fired after the activations are freed, so a callback that steps part
             # of the model here is not doing it at the peak of the micro-batch.
-            self.callbacks.on_microbatch_end(self, state, i, micro_counts)
+            self.callbacks.on_microbatch_end(self, state, i, micro_counts, micro_loss)
 
         # One collective for all scalars, one for the counts. Counts are reduced
         # BEFORE anything is derived from them, so every rank sees the same numbers.

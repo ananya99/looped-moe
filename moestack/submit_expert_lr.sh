@@ -46,7 +46,7 @@ REPO_DIR=looped-moe                 # relative to the job's working dir (scratch
 VENV=.venv                          # relative to REPO_DIR
 
 ARCH=deepseek                       # deepseek | olmoe | qwen3moe
-SCALE=tiny                          # tiny | small | regular
+SCALE=regular                       # tiny | small | regular
 OPTIMIZER=muon                      # per-expert LR requires muon (it raises under adamw)
 NODE_TYPE=h200
 GPUS=1                              # >1 switches the launcher to torchrun
@@ -54,15 +54,38 @@ GPUS=1                              # >1 switches the launcher to torchrun
 N_STEPS=2000
 SEED=42
 LR=0.02
-BATCH_SIZE=16                       # per rank
-GRAD_ACCUM=16
+
+# bs x ga = 256 holds tokens/step at 524,288 for every scale, so a cell always sees
+# the same 1.05B tokens and stays inside the cache's single epoch. Measured on one
+# H200 (150.8 GB) at regular, 7.12B params / 872M active per token:
+#
+#   2x128  94.0 GB  12.7k tok/s      checkpointed activations cost ~1.2 GB/sample
+#   4x64   97.1 GB  14.4k tok/s      on a ~91 GB floor of params + grads + Muon
+#   8x32  101.7 GB  15.6k tok/s      momentum + AdamW moments. Bigger micro-batches
+#  16x16  113.3 GB  16.4k tok/s  <-  are strictly faster, so take the largest that
+#                                    still leaves room (37 GB spare) -> ~18 h/cell.
+#
+# ACT_CKPT is not tuning at regular scale: unchecked activations cost ~12.7 GB per
+# sample, so bs=4 alone peaks at 143.4 GB and bs=16 cannot run at all.
+# small is untested -- 8x32 is a conservative carry-over and can probably take 16x16.
+case "$SCALE" in
+    tiny)    BATCH_SIZE=16; GRAD_ACCUM=16; ACT_CKPT=false ;;
+    small)   BATCH_SIZE=8;  GRAD_ACCUM=32; ACT_CKPT=true  ;;
+    regular) BATCH_SIZE=16; GRAD_ACCUM=16; ACT_CKPT=true  ;;
+esac
+
 AUX_BASELINE=0.01                   # the balanced reference cell's aux coefficient
 STATS_EVERY=50                      # per-expert JSONL dump cadence; 0 disables
+SAVE_EVERY=250                      # a reclaim costs at most this much work:
+                                    # 2.2 h at regular, 69 min at small. Each
+                                    # regular checkpoint is ~60 GB and they are
+                                    # kept, so this is ~480 GB per cell.
 
 ALPHAS="-0.5 0.25 0.5 1"            # 0 is the control cell below, not part of the sweep
-EMAS="0 0.9"                        # 0 = raw per-step counts
+EMAS="0"                        # 0 = raw per-step counts
 
-TIME=16h                            # per attempt; a hang guard, not a budget
+TIME=24h                            # per attempt; regular is ~18 h/cell, so one
+                                    # attempt covers a cell with margin
 BACKOFF=4                           # runai retries before the job is marked Failed
 # ===================================================================
 
@@ -96,8 +119,9 @@ COMMON=(
     "model.arch=$ARCH" "model.scale=$SCALE" "optim.name=$OPTIMIZER" "optim.lr=$LR"
     "data.batch_size=$BATCH_SIZE" "data.grad_accum=$GRAD_ACCUM"
     "train.n_steps=$N_STEPS" "train.seed=$SEED"
-    "logging.expert_stats_every=$STATS_EVERY"
+    "logging.expert_stats_every=$STATS_EVERY" "train.save_every=$SAVE_EVERY"
     "logging.load_stats_per_layer=true"
+    "parallel.activation_checkpointing=$ACT_CKPT"
 )
 
 # The disk cache wraps silently, so say so before 10 jobs quietly train two epochs.
@@ -182,12 +206,12 @@ echo "  $ARCH-$SCALE $OPTIMIZER lr=$LR  ${BATCH_SIZE}x${GRAD_ACCUM}x2048 x ${N_S
 
 # Balanced: the load-balancing loss does the work. What the grid has to beat.
 NOTES="balanced reference, aux $AUX_BASELINE" \
-# run baseline "loss.aux_coef=$AUX_BASELINE"
+run baseline "loss.aux_coef=$AUX_BASELINE"
 
 # Imbalanced, untouched. alpha=0 leaves per_expert_lr disabled entirely, so this is
 # the plain baseline in the regime the grid intervenes in.
 NOTES="imbalanced control, no per-expert LR" \
-# run a0 "loss.aux_coef=0"
+run a0 "loss.aux_coef=0"
 
 # -------------------------------------------------------------------------------------
 # 2. The grid: {raw, ema} x alpha, all at aux 0 with normalize on

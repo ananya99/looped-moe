@@ -31,6 +31,7 @@ from pathlib import Path
 
 import torch
 
+from .expert_accum import AccumState, accum_metrics, grad_scale, resolve_threshold
 from .expert_lr import ema_update, lr_scales_from_counts, scale_summary
 from .stats import delta_norms, drift_metrics, gini, load_metrics, row_norms
 
@@ -205,6 +206,148 @@ class PerExpertLR(Callback):
     def load_state_dict(self, sd):
         self.ema = sd.get("ema")
         self.cum, self.cum_n = sd.get("cum"), sd.get("cum_n", 0)
+
+
+class ExpertAccumulation(Callback):
+    """Expert-local gradient accumulation: fix the token budget per update instead
+    of the clock.
+
+    The baseline gives every expert one update per step, built from whatever the
+    router happened to send it -- a big-batch estimate for a hot expert, a handful
+    of tokens for a cold one, and pure renormalised stale momentum for a dead one.
+    Here an expert keeps its gradient until about `threshold` tokens have reached
+    it, then takes one update and resets; hot experts simply update more often.
+
+    The whole intervention is four lines of plumbing around a pure rule:
+
+    1. `p.grad` *is* the window. Registering the expert tensors in
+       `trainer.grad_accumulators` is what stops the trainer clearing them between
+       batches and clipping them -- so accumulation costs no extra memory.
+    2. `expert_accum.AccumState` decides who fires, from the same all-reduced
+       `[L, E]` counts the load statistics read. Identical counts on every rank
+       mean identical decisions, with no extra collective.
+    3. The firing slices' gradients are divided by the tokens they were built from
+       and the rest are left alone, then `Optimizers.set_expert_update_mask` gates
+       Muon so only those slices step -- weights, decay *and* momentum.
+    4. Once the optimizer has stepped, those slices' gradients are zeroed; every
+       other window carries on filling.
+
+    Two cases that are easy to miss:
+
+    - A batch the trainer **drops** as non-finite has already added its gradient to
+      every open window, and it cannot be subtracted back out. So a dropped batch
+      throws away every window rather than carrying a poisoned one -- which is also
+      why the work happens on `on_accepted_step` and not `on_before_optimizer_step`.
+    - The **final flush** closes whatever is still open before the run's last eval
+      and save, or the last partial window of every expert is silently discarded.
+      Only the experts step there; the shared parameters finished with the last
+      batch.
+
+    Not resumable, deliberately: the open windows are in the gradient buffers,
+    which `checkpoint.py` does not write. `config.py` refuses the combination
+    rather than restoring token counts without the gradients they stand for.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.state, self.threshold, self.experts = None, None, []
+        self._fired, self._metrics, self._accepted = None, {}, False
+        self.discarded = 0
+
+    # -- setup ---------------------------------------------------------
+    def on_train_start(self, trainer):
+        if self.cfg.clock != "step":
+            raise NotImplementedError(
+                f"optim.expert_accum.clock={self.cfg.clock!r} is not wired up yet: "
+                "the event-driven clock also needs a per-micro-batch finite check, "
+                "because an expert that fires mid-batch cannot be un-stepped")
+        if not trainer.optimizers.expert_lr_groups():
+            raise RuntimeError("ExpertAccumulation: no per-layer expert param groups -- "
+                               "build_optimizers(..., split_experts=True) is required")
+        args = trainer.args
+        self.experts = [(m.experts.gate_up_proj, m.experts.down_proj)
+                        for m in trainer.model.moe_layers()]
+        trainer.grad_accumulators.extend(p for pair in self.experts for p in pair)
+        self.state = AccumState.zeros(args.n_layers, args.n_experts,
+                                      device=trainer.dist.device)
+        per_tick = trainer.tokens_per_step      # one tick = one step on this clock
+        self.threshold = resolve_threshold(self.cfg.threshold, self.cfg.threshold_rel,
+                                           per_tick, args.top_k, args.n_experts)
+        if trainer.verbose:
+            balanced = per_tick * args.top_k / args.n_experts
+            print(f"  expert accumulation: clock={self.cfg.clock} Q={self.threshold} "
+                  f"D={self.cfg.max_window} grad_scale={self.cfg.grad_scale} "
+                  f"({balanced:,.0f} tokens/expert/tick at perfect balance)")
+
+    # -- the cycle -----------------------------------------------------
+    def on_before_optimizer_step(self, trainer, state):
+        self._accepted = False      # until the trainer says otherwise
+
+    def on_accepted_step(self, trainer, state):
+        self._accepted = True
+        if state.expert_counts is None:
+            return
+        self.state.observe(state.expert_counts)
+        event = self.state.ready(self.threshold, self.cfg.max_window)
+        tokens = self.state.consume(event.fire, state.step)
+        self._arm(trainer, event, tokens)
+        self._fired = event.fire
+        self._metrics = accum_metrics(self.state, event, tokens, self.threshold)
+
+    def on_step_end(self, trainer, state):
+        if not self._accepted:
+            self._zero_every_window()
+            self.state.discard()
+            self.discarded += 1
+            self._metrics = {}
+            return
+        if self._fired is not None:
+            self._zero(self._fired)
+            self._fired = None
+        self._metrics["accum/discarded_windows"] = self.discarded
+        if self.threshold:
+            self._metrics["accum/threshold"] = self.threshold
+        state.metrics.update(self._metrics)
+        self._metrics = {}
+
+    def on_before_final_eval(self, trainer, state) -> bool:
+        event = self.state.flush()
+        if not event.any:
+            return False
+        self._arm(trainer, event, self.state.consume(event.fire, trainer.step))
+        trainer.optimizers.step(only="expert")
+        self._zero(event.fire)
+        trainer.optimizers.set_expert_update_mask(None)
+        return True
+
+    # -- plumbing ------------------------------------------------------
+    def _arm(self, trainer, event, tokens):
+        """Scale the firing gradients and gate the optimizer to those slices."""
+        if self.cfg.grad_scale != "sum":
+            scales = grad_scale(tokens, event.fire, self.cfg.grad_scale)
+            for layer, pair in enumerate(self.experts):
+                # Exactly 1.0 off the firing slices, so a window that is still
+                # filling is multiplied by one rather than disturbed.
+                v = scales[layer].view(-1, 1, 1)
+                for p in pair:
+                    if p.grad is not None:
+                        p.grad.mul_(v)
+        trainer.optimizers.set_expert_update_mask(event.fire)
+
+    def _zero(self, fire):
+        for layer, pair in enumerate(self.experts):
+            idx = fire[layer].nonzero().flatten()
+            if not idx.numel():
+                continue
+            for p in pair:
+                if p.grad is not None:
+                    p.grad.index_fill_(0, idx, 0.0)
+
+    def _zero_every_window(self):
+        for pair in self.experts:
+            for p in pair:
+                if p.grad is not None:
+                    p.grad.zero_()
 
 
 class ExpertStats(Callback):

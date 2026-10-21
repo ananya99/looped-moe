@@ -442,9 +442,16 @@ def test_an_absolute_threshold_is_taken_as_written():
     assert resolve_threshold(1024, None, tokens_per_tick=1, top_k=1, n_experts=1) == 1024
 
 
+def test_no_threshold_at_all_is_the_fixed_window_variant():
+    """Neither setting means the window is closed by max_window alone -- a real
+    configuration (fixed-length windows), not a mistake. `ready` is what refuses a
+    rule with no closing condition at all."""
+    assert resolve_threshold(None, None, tokens_per_tick=1000, top_k=1,
+                             n_experts=10) is None
+
+
 @pytest.mark.parametrize("kw, match", [
-    (dict(threshold=None, threshold_rel=None), "exactly one of"),
-    (dict(threshold=1024, threshold_rel=2.0), "exactly one of"),
+    (dict(threshold=1024, threshold_rel=2.0), "at most one of"),
     (dict(threshold=0, threshold_rel=None), "at least 1 token"),
     (dict(threshold=None, threshold_rel=0.0), "must be positive"),
     (dict(threshold=None, threshold_rel=-1.0), "must be positive"),
@@ -653,3 +660,222 @@ def test_nothing_is_registered_by_default_and_the_whole_model_is_clipped(tmp_pat
     t = _fit(tmp_path, _Recorder(), train=dict(n_steps=1))
     assert t.grad_accumulators == []
     assert list(t._clipped_params()) == list(t.model.parameters())
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Stage 4: the callback on the step clock (moestack/callbacks.py)
+# ──────────────────────────────────────────────────────────────────────
+
+from moestack.callbacks import ExpertAccumulation                # noqa: E402
+from moestack.config import Config                               # noqa: E402
+
+
+def _accum_cfg(tmp_path, steps=3, **accum):
+    cfg = tiny_config(tmp_path, train=dict(n_steps=steps))
+    cfg.optim.expert_accum.enabled = True
+    for k, v in accum.items():
+        setattr(cfg.optim.expert_accum, k, v)
+    cfg.__post_init__()
+    return cfg
+
+
+def _accum_fit(tmp_path, cb=None, steps=3, **accum):
+    t = Trainer(_accum_cfg(tmp_path, steps, **accum), callbacks=[cb] if cb else [],
+                verbose=False)
+    t.fit()
+    return t
+
+
+def _expert_weights(trainer):
+    return torch.cat([m.experts.gate_up_proj.detach().flatten()
+                      for m in trainer.model.moe_layers()])
+
+
+def _expert_grad_mass(trainer):
+    """|grad| summed over each expert's gate_up matrix -> [L, E]."""
+    return torch.stack([m.experts.gate_up_proj.grad.flatten(1).abs().sum(1)
+                        for m in trainer.model.moe_layers()])
+
+
+class _Watch(Callback):
+    """Snapshots the mask the accumulator armed, and the state it left behind."""
+
+    def __init__(self):
+        self.rows, self.mask, self.start, self.shared0 = [], None, None, None
+
+    def on_train_start(self, trainer):
+        self.start = _expert_weights(trainer).clone()
+        self.shared0 = trainer.model.tok_embeddings.weight.detach().clone()
+
+    def on_accepted_step(self, trainer, state):
+        groups = trainer.optimizers.expert_lr_groups()
+        self.mask = torch.stack([g[0]["update_mask"]
+                                 for _, g in sorted(groups.items())]).clone()
+
+    def on_step_end(self, trainer, state):
+        self.rows.append((self.mask, _expert_grad_mass(trainer).clone(),
+                          state.expert_counts.clone(),
+                          _expert_weights(trainer).clone()))
+
+
+# ── the window, end to end ───────────────────────────────────────────
+
+def test_experts_stay_frozen_while_their_windows_fill_and_the_rest_of_the_model_trains(tmp_path):
+    w = _Watch()
+    t = _accum_fit(tmp_path, w, steps=3, threshold=10**9)      # a budget nothing reaches
+    assert all(not m.any() for m, *_ in w.rows)                # nobody ever fired
+    for _, _, _, weights in w.rows:
+        assert torch.equal(weights, w.start)                   # ... and nobody moved
+    # The shared parameters trained all along: this is not a frozen model.
+    assert not torch.equal(t.model.tok_embeddings.weight.detach(), w.shared0)
+    assert t.step == 3
+
+
+def test_a_waiting_experts_gradient_keeps_growing_instead_of_being_cleared(tmp_path):
+    w = _Watch()
+    _accum_fit(tmp_path, w, steps=3, threshold=10**9)
+    mass = [g.sum().item() for _, g, _, _ in w.rows]
+    assert mass[1] > mass[0] and mass[2] > mass[1]
+
+
+def test_the_final_flush_applies_the_window_the_run_never_filled(tmp_path):
+    """Without it, every expert's last partial window is silently thrown away --
+    and with a budget this large, that is the entire run."""
+    w = _Watch()
+    t = _accum_fit(tmp_path, w, steps=3, threshold=10**9)
+    assert not torch.equal(_expert_weights(t), w.start)
+
+
+def test_at_a_budget_of_one_token_exactly_the_experts_that_saw_tokens_fire(tmp_path):
+    """Q=1, D=1 is the active-only control: no accumulation, but no stepping a
+    zero-token expert on renormalised stale momentum either."""
+    w = _Watch()
+    _accum_fit(tmp_path, w, steps=2, threshold=1, max_window=1)
+    for mask, _, counts, _ in w.rows:
+        assert torch.equal(mask, counts > 0)
+
+
+def test_a_fired_window_is_cleared_and_the_others_are_left_filling(tmp_path):
+    w = _Watch()
+    _accum_fit(tmp_path, w, steps=4, threshold=100)
+    fired_any = False
+    for mask, mass, _, _ in w.rows:
+        assert mass[mask].sum() == 0, "a fired expert kept its gradient"
+        fired_any |= bool(mask.any())
+        if (~mask).any():
+            assert mass[~mask].sum() > 0, "a waiting expert lost its gradient"
+    assert fired_any, "nothing fired, so this proves nothing -- lower the threshold"
+
+
+def test_an_expert_that_waits_takes_exactly_the_step_the_summed_gradient_would(tmp_path):
+    """The arithmetic the whole scheme rests on, at the optimizer level: three
+    batches accumulated into `p.grad` behind a closed mask, then fired, equal one
+    step on their sum."""
+    g1, g2, g3 = _grads(3, seed=11)
+    w0 = torch.randn(E, OUT, IN)
+
+    p = torch.nn.Parameter(w0.clone())
+    opt = Muon([p], **MUON_KW)
+    p.grad = torch.zeros_like(p)
+    for i, g in enumerate((g1, g2, g3)):
+        p.grad += g                                    # never cleared
+        opt.param_groups[0]["update_mask"] = torch.full((E,), i == 2, dtype=torch.bool)
+        opt.step()
+
+    summed, _ = _run(torch.nn.Parameter(w0.clone()), [g1 + g2 + g3])
+    torch.testing.assert_close(p.data, summed.data)
+
+
+# ── a batch the trainer rejects ──────────────────────────────────────
+
+def test_a_dropped_batch_throws_away_every_open_window(tmp_path):
+    """Its gradient is already in the accumulators and cannot be subtracted back
+    out, so carrying on would mean every expert's next update contains it."""
+    cfg = _accum_cfg(tmp_path, steps=3, threshold=10**9)
+    w = _Watch()
+    t = Trainer(cfg, callbacks=[_Poisoner(at_step=1), w], verbose=False)
+    t.fit()
+    acc = next(c for c in t.callbacks.callbacks if isinstance(c, ExpertAccumulation))
+    assert acc.discarded == 1
+    # step 0 filled a window, step 1 was dropped and cleared it, step 2 refilled.
+    mass = [g.sum().item() for _, g, _, _ in w.rows]
+    assert mass[1] == 0 and 0 < mass[2] < mass[0] * 2
+
+
+# ── configuration ────────────────────────────────────────────────────
+
+def test_accumulation_is_off_by_default_and_changes_no_run_name():
+    cfg = Config()
+    assert not cfg.optim.expert_accum.enabled
+    assert "acc" not in cfg.run_name().split("-lr")[1]
+
+
+def test_the_trainer_only_builds_the_callback_when_it_is_enabled(tmp_path):
+    plain = Trainer(tiny_config(tmp_path, train=dict(n_steps=1)), verbose=False)
+    assert not any(isinstance(c, ExpertAccumulation) for c in plain.callbacks.callbacks)
+    on = Trainer(_accum_cfg(tmp_path, steps=1, threshold=100), verbose=False)
+    assert any(isinstance(c, ExpertAccumulation) for c in on.callbacks.callbacks)
+
+
+def test_enabling_it_splits_the_expert_tensors_so_they_can_be_addressed(tmp_path):
+    t = Trainer(_accum_cfg(tmp_path, steps=1, threshold=100), verbose=False)
+    assert t.optimizers.expert_lr_groups()
+
+
+def test_every_cell_of_the_grid_gets_its_own_name(tmp_path):
+    names = set()
+    for kw in (dict(threshold_rel=2.0, max_window=8), dict(threshold_rel=4.0, max_window=8),
+               dict(threshold_rel=2.0, max_window=16), dict(threshold=1, max_window=1),
+               dict(threshold_rel=2.0, max_window=8, grad_scale="sum"),
+               dict(max_window=4)):
+        names.add(_accum_cfg(tmp_path, **kw).run_name())
+    assert len(names) == 6
+
+
+@pytest.mark.parametrize("kw, match", [
+    (dict(threshold=100), "needs optim.name=muon"),
+])
+def test_accumulation_under_adamw_fails_at_startup(kw, match):
+    cfg = Config()
+    cfg.optim.name = "adamw"
+    cfg.optim.expert_accum.enabled = True
+    for k, v in kw.items():
+        setattr(cfg.optim.expert_accum, k, v)
+    with pytest.raises(ValueError, match=match):
+        cfg.__post_init__()
+
+
+@pytest.mark.parametrize("accum, train, match", [
+    (dict(), {}, "no expert would ever update"),
+    (dict(threshold=1, threshold_rel=1.0), {}, "at most one of"),
+    (dict(threshold=1, clock="hourly"), {}, "clock must be"),
+    (dict(threshold=1, grad_scale="median"), {}, "grad_scale must be"),
+    (dict(threshold=1, max_window=0), {}, "at least 1 tick"),
+    (dict(threshold=1), dict(auto_resume=True), "not resumable"),
+    (dict(threshold=1), dict(resume="x.pt"), "not resumable"),
+])
+def test_an_ill_defined_accumulation_run_fails_at_startup(accum, train, match):
+    cfg = Config()
+    cfg.optim.expert_accum.enabled = True
+    for k, v in accum.items():
+        setattr(cfg.optim.expert_accum, k, v)
+    for k, v in train.items():
+        setattr(cfg.train, k, v)
+    with pytest.raises(ValueError, match=match):
+        cfg.__post_init__()
+
+
+def test_accumulation_and_per_expert_lr_cannot_both_be_on():
+    cfg = Config()
+    cfg.optim.expert_accum.enabled = True
+    cfg.optim.expert_accum.threshold = 100
+    cfg.optim.per_expert_lr.alpha = 0.5
+    with pytest.raises(ValueError, match="cannot both be on"):
+        cfg.__post_init__()
+
+
+def test_the_microbatch_clock_says_it_is_not_ready_yet(tmp_path):
+    t = Trainer(_accum_cfg(tmp_path, steps=1, threshold=100, clock="microbatch"),
+                verbose=False)
+    with pytest.raises(NotImplementedError, match="not wired up yet"):
+        t.fit()

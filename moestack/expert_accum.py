@@ -70,10 +70,12 @@ def resolve_threshold(threshold: int | None, threshold_rel: float | None,
     copied from a paper written at another scale either fires every tick or never.
     `threshold_rel=k` asks for windows of about k ticks for an average expert.
     """
-    if (threshold is None) == (threshold_rel is None):
-        raise ValueError("set exactly one of threshold (tokens) and threshold_rel "
+    if threshold is not None and threshold_rel is not None:
+        raise ValueError("set at most one of threshold (tokens) and threshold_rel "
                          "(multiples of a balanced expert's per-tick load), got "
                          f"threshold={threshold}, threshold_rel={threshold_rel}")
+    if threshold is None and threshold_rel is None:
+        return None             # the fixed-window variant: max_window alone decides
     if threshold is not None:
         if threshold < 1:
             raise ValueError(f"threshold must be at least 1 token, got {threshold}")
@@ -180,6 +182,18 @@ class AccumState:
         """
         open_ = self.pending > 0
         return Event(fire=open_, by_threshold=torch.zeros_like(open_), by_timeout=open_)
+
+    def discard(self) -> None:
+        """Throw away every open window without recording an event.
+
+        For a batch the trainer rejects as non-finite. Its gradient has already
+        landed in the accumulators and cannot be subtracted back out, so the only
+        safe move is to drop what every window holds and start again. `events` and
+        `last_event` survive, because the history of what *did* update is still
+        true.
+        """
+        self.pending = torch.zeros_like(self.pending)
+        self.age = torch.zeros_like(self.age)
 
     # -- checkpointing -------------------------------------------------
     def state_dict(self) -> dict:

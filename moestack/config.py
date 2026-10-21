@@ -144,6 +144,32 @@ class PerExpertLRConfig:
 
 
 @dataclass
+class ExpertAccumConfig:
+    """Expert-local gradient accumulation: each expert updates once it has been
+    routed about `threshold` tokens, instead of once per optimizer step.
+
+    Defaults are off, and `enabled=False` leaves every code path exactly as it was.
+    See moestack/expert_accum.py for the rule and what each field costs.
+    """
+    enabled: bool = False
+    # Which tick drives the decision. "step" is the batch-level version: experts
+    # still update at step boundaries, just not every step. "microbatch" is the
+    # event-driven one, where an expert can update several times within a step.
+    # Plain str, not Literal: omegaconf cannot wrap a Literal annotation, and
+    # the value is validated in Config.__post_init__ like the other enums.
+    clock: str = "step"
+    threshold: Optional[int] = None       # Q, in routed tokens
+    # Q as a multiple of a balanced expert's per-tick load. The setting that
+    # transfers across scales: at tiny scale a balanced expert already sees ~3k
+    # tokens per micro-batch and ~49k per step.
+    threshold_rel: Optional[float] = None
+    max_window: Optional[int] = None      # D, the staleness cap, in ticks
+    # "mean" divides an event's gradient by the tokens it was built from, so window
+    # length does not decide how heavily an event weighs in the momentum buffer.
+    grad_scale: str = "mean"
+
+
+@dataclass
 class OptimConfig:
     name: str = "muon"           # muon | adamw
     lr: float = 2e-2             # base LR; each rule scales it by lr_mult
@@ -154,6 +180,7 @@ class OptimConfig:
     muon_nesterov: bool = True
     adamw_betas: List[float] = field(default_factory=lambda: [0.9, 0.95])
     per_expert_lr: PerExpertLRConfig = field(default_factory=PerExpertLRConfig)
+    expert_accum: ExpertAccumConfig = field(default_factory=ExpertAccumConfig)
 
 
 @dataclass
@@ -270,6 +297,47 @@ class Config:
         if not 0.0 <= pe.clamp_min <= pe.clamp_max:
             raise ValueError(f"optim.per_expert_lr needs 0 <= clamp_min <= clamp_max, "
                              f"got [{pe.clamp_min}, {pe.clamp_max}]")
+        ea = self.optim.expert_accum
+        if ea.enabled:
+            if self.optim.name != "muon":
+                # Same reason as per_expert_lr: under AdamW the experts are single
+                # 3D tensors with one step for all of them, so there is nothing to
+                # fire individually.
+                raise ValueError(f"optim.expert_accum needs optim.name=muon, got "
+                                 f"{self.optim.name!r}: an expert is addressed one "
+                                 f"slice at a time inside Muon's batched step")
+            if pe.enabled:
+                # They compose in principle (mask x multiplier), but the LR rule is
+                # derived per step while accumulation's natural unit is per event.
+                # Running both would confound two interventions in one cell.
+                raise ValueError("optim.expert_accum and optim.per_expert_lr cannot "
+                                 "both be on: they are separate interventions and "
+                                 "would confound each other")
+            if ea.clock not in ("step", "microbatch"):
+                raise ValueError(f"optim.expert_accum.clock must be step | microbatch, "
+                                 f"got {ea.clock!r}")
+            if ea.grad_scale not in ("mean", "sum"):
+                raise ValueError(f"optim.expert_accum.grad_scale must be mean | sum, "
+                                 f"got {ea.grad_scale!r}")
+            if ea.threshold is not None and ea.threshold_rel is not None:
+                raise ValueError("optim.expert_accum takes at most one of threshold "
+                                 "and threshold_rel")
+            if ea.threshold is None and ea.threshold_rel is None and ea.max_window is None:
+                raise ValueError("optim.expert_accum needs a threshold, a threshold_rel "
+                                 "or a max_window -- with none of them, no expert "
+                                 "would ever update")
+            if ea.max_window is not None and ea.max_window < 1:
+                raise ValueError(f"optim.expert_accum.max_window must be at least 1 "
+                                 f"tick, got {ea.max_window}")
+            if self.train.resume or self.train.auto_resume:
+                # An open window lives in `p.grad`, which checkpoint.py does not
+                # write (it would roughly double the expert half of every file).
+                # Resuming would restore the token counts without the gradients they
+                # stand for, so it is refused rather than silently wrong.
+                raise ValueError("optim.expert_accum runs are not resumable: the open "
+                                 "windows are in the gradient buffers, which are not "
+                                 "checkpointed. Run uninterrupted, or clear "
+                                 "train.resume / train.auto_resume")
 
     def significant_overrides(self) -> dict:
         """{dotted key: value} for every learning-relevant field that differs from
@@ -323,9 +391,19 @@ class Config:
             per_expert += f"-aneg{fmt(abs(pe.alpha))}" if pe.alpha < 0 else f"-a{fmt(pe.alpha)}"
         if pe.freeze_dead:
             per_expert += "-freeze"
+        ea, accum = self.optim.expert_accum, ""
+        if ea.enabled:
+            budget = ("q" + fmt(ea.threshold) if ea.threshold is not None else
+                      "r" + fmt(ea.threshold_rel) if ea.threshold_rel is not None else
+                      "fixed")
+            accum = f"-acc{'mb' if ea.clock == 'microbatch' else 'st'}{budget}"
+            if ea.max_window:
+                accum += f"w{ea.max_window}"
+            if ea.grad_scale != "mean":
+                accum += f"-{ea.grad_scale}"
         return (f"{self.model.arch}-{self.model.scale}-{self.optim.name}"
                 f"-aux{fmt(self.loss.aux_coef)}-z{fmt(self.loss.z_coef)}"
-                f"-lr{fmt(self.optim.lr)}{per_expert}-{self.fingerprint()}")
+                f"-lr{fmt(self.optim.lr)}{per_expert}{accum}-{self.fingerprint()}")
 
     def run_name(self) -> str:
         """Encodes every field that distinguishes a baseline cell, so two runs can

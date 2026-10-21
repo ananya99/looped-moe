@@ -17,8 +17,8 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from . import checkpoint
-from .callbacks import (CallbackList, ConsoleLogger, ExpertStats, MoELoadStats, PerExpertLR,
-                        StepState, WandbLogger)
+from .callbacks import (CallbackList, ConsoleLogger, ExpertAccumulation, ExpertStats,
+                        MoELoadStats, PerExpertLR, StepState, WandbLogger)
 from .config import Config
 from .data import build_eval_batches, build_train_iterator
 from .initialization import init_weights
@@ -54,12 +54,15 @@ class Trainer:
 
         # split_experts puts each layer's expert tensors in their own param groups,
         # which is what makes them individually addressable; it changes no arithmetic.
+        split = cfg.optim.per_expert_lr.enabled or cfg.optim.expert_accum.enabled
         self.optimizers = build_optimizers(self.model, cfg.optim, verbose=self.verbose,
-                                           split_experts=cfg.optim.per_expert_lr.enabled)
+                                           split_experts=split)
 
         cbs = [MoELoadStats(cfg.logging.load_stats_per_layer)] if cfg.logging.load_stats else []
         if cfg.optim.per_expert_lr.enabled:
             cbs.append(PerExpertLR(cfg.optim.per_expert_lr))
+        if cfg.optim.expert_accum.enabled:
+            cbs.append(ExpertAccumulation(cfg.optim.expert_accum))
         if cfg.logging.expert_stats_every:
             cbs.append(ExpertStats(cfg.logging.expert_stats_every))
         cbs += list(callbacks or [])

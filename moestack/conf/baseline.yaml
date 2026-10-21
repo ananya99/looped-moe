@@ -33,6 +33,21 @@ optim:
     normalize: true       # keep the mean rate over alive experts at 1.0
     clamp_min: 1.0e-3
     clamp_max: 10.0
+  # Expert-local gradient accumulation. Off by default; enabling it fixes the
+  # token budget per update instead of the clock, so hot experts update more
+  # often and cold ones accumulate until they have something to say.
+  #   optim.expert_accum.enabled=true optim.expert_accum.threshold_rel=2 \
+  #     optim.expert_accum.max_window=8
+  # threshold_rel counts multiples of a balanced expert's per-tick load (~49k
+  # tokens per step at 16x16x2048 with 64 experts and top-6). Not resumable:
+  # the open windows live in the gradient buffers, which are not checkpointed.
+  expert_accum:
+    enabled: false
+    clock: step           # step | microbatch (microbatch not wired up yet)
+    threshold: null       # Q in routed tokens; or set threshold_rel instead
+    threshold_rel: null   # Q as a multiple of a balanced expert's per-tick load
+    max_window: null      # D, the staleness cap, in ticks
+    grad_scale: mean      # mean = divide an event by the tokens it was built from
 
 parallel:
   dp: -1                  # -1 = all ranks

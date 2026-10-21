@@ -6,10 +6,19 @@ stateful; their `state_dict` goes into the checkpoint.
 
 Events (in order within a step):
     on_train_start(trainer)
+    on_microbatch_end(trainer, state, i, counts)   after each micro-batch's backward
     on_before_optimizer_step(trainer, state)   grads are final (reduced + clipped)
+    on_accepted_step(trainer, state)           ... and the step was not dropped
     on_step_end(trainer, state)                params updated
     on_eval(trainer, state, metrics)
+    on_before_final_eval(trainer, state)       -> bool: "did you move the weights?"
     on_train_end(trainer, state)
+
+`on_microbatch_end` carries that micro-batch's *rank-local* `[L, E]` counts; only
+`state.expert_counts` is reduced over the global batch. `on_accepted_step` is
+`on_before_optimizer_step` minus the steps the trainer drops for a non-finite loss
+or gradient norm -- anything that changes weights or consumes accumulated state
+belongs there, because a dropped batch must leave both untouched.
 """
 
 from __future__ import annotations
@@ -39,9 +48,13 @@ class StepState:
 
 class Callback:
     def on_train_start(self, trainer): ...
+    def on_microbatch_end(self, trainer, state: StepState, micro_step: int,
+                          counts: torch.Tensor): ...
     def on_before_optimizer_step(self, trainer, state: StepState): ...
+    def on_accepted_step(self, trainer, state: StepState): ...
     def on_step_end(self, trainer, state: StepState): ...
     def on_eval(self, trainer, state: StepState, metrics: dict): ...
+    def on_before_final_eval(self, trainer, state: StepState) -> bool: return False
     def on_train_end(self, trainer, state: StepState): ...
     def state_dict(self) -> dict: return {}
     def load_state_dict(self, sd: dict): ...
@@ -56,10 +69,17 @@ class CallbackList(Callback):
             getattr(cb, name)(*args)
 
     def on_train_start(self, t): self._fire("on_train_start", t)
+    def on_microbatch_end(self, t, s, i, c): self._fire("on_microbatch_end", t, s, i, c)
     def on_before_optimizer_step(self, t, s): self._fire("on_before_optimizer_step", t, s)
+    def on_accepted_step(self, t, s): self._fire("on_accepted_step", t, s)
     def on_step_end(self, t, s): self._fire("on_step_end", t, s)
     def on_eval(self, t, s, m): self._fire("on_eval", t, s, m)
     def on_train_end(self, t, s): self._fire("on_train_end", t, s)
+
+    def on_before_final_eval(self, t, s) -> bool:
+        # The one event with a return value. A list, not a generator: every
+        # callback has to run even once one of them has answered yes.
+        return any([cb.on_before_final_eval(t, s) for cb in self.callbacks])
 
     def state_dict(self):
         return {type(cb).__name__: cb.state_dict() for cb in self.callbacks}

@@ -188,9 +188,13 @@ class Optimizers:
             raise ValueError(f"update mask must be a bool tensor, got {mask.dtype}")
         self._set_expert_attr("update_mask", mask, "per-expert update masks")
 
-    def zero_grad(self, set_to_none: bool = True):
-        for o in self.optimizers.values():
-            o.zero_grad(set_to_none=set_to_none)
+    def zero_grad(self, set_to_none: bool = True, keep=()):
+        """`keep` names parameters whose `.grad` is a multi-batch accumulator rather
+        than this batch's gradient (moestack/expert_accum.py), and so must survive
+        the clear. Empty by default, which is the original behaviour."""
+        with _hidden_grads(keep):
+            for o in self.optimizers.values():
+                o.zero_grad(set_to_none=set_to_none)
 
     def step(self, only: str | None = None):
         """`only="expert"` steps just the groups holding expert tensors and leaves

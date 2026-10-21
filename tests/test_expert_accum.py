@@ -487,3 +487,169 @@ def test_metrics_are_finite_when_nothing_fires():
     assert m["accum/event_fraction"] == 0.0
     assert all(not math.isnan(v) for v in m.values())
     assert "accum/tokens_per_event_mean" not in m
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Stage 3: the trainer's seams (moestack/trainer.py, moestack/callbacks.py)
+# ──────────────────────────────────────────────────────────────────────
+
+from moestack.callbacks import Callback                          # noqa: E402
+from moestack.trainer import Trainer                             # noqa: E402
+
+from conftest import tiny_config                                 # noqa: E402
+
+
+class _Recorder(Callback):
+    """Writes down every event it is handed, in order."""
+
+    def __init__(self, flush_moved=False):
+        self.log, self.flush_moved = [], flush_moved
+
+    def on_microbatch_end(self, trainer, state, micro_step, counts):
+        self.log.append(("micro", state.step, micro_step, tuple(counts.shape)))
+
+    def on_before_optimizer_step(self, trainer, state):
+        self.log.append(("before", state.step))
+
+    def on_accepted_step(self, trainer, state):
+        self.log.append(("accepted", state.step))
+
+    def on_step_end(self, trainer, state):
+        self.log.append(("end", state.step))
+
+    def on_eval(self, trainer, state, metrics):
+        self.log.append(("eval", trainer.step))
+
+    def on_before_final_eval(self, trainer, state):
+        self.log.append(("flush", trainer.step))
+        return self.flush_moved
+
+    def kinds(self, step):
+        return [e[0] for e in self.log if len(e) > 1 and e[1] == step and e[0] != "eval"]
+
+
+def _fit(tmp_path, cb, **sections):
+    cfg = tiny_config(tmp_path, **sections)
+    t = Trainer(cfg, callbacks=[cb], verbose=False)
+    t.fit()
+    return t
+
+
+def test_a_microbatch_event_fires_once_per_microbatch_before_the_step_events(tmp_path):
+    cb = _Recorder()
+    t = _fit(tmp_path, cb, train=dict(n_steps=2))
+    accum = t.cfg.data.grad_accum
+    assert cb.kinds(0) == ["micro"] * accum + ["before", "accepted", "end"]
+    assert cb.kinds(1) == ["micro"] * accum + ["before", "accepted", "end"]
+    assert [e[2] for e in cb.log if e[0] == "micro" and e[1] == 0] == list(range(accum))
+
+
+def test_the_microbatch_event_carries_that_microbatchs_own_counts(tmp_path):
+    seen = []
+
+    class Watch(Callback):
+        def on_microbatch_end(self, trainer, state, micro_step, counts):
+            seen.append(counts.clone())
+
+        def on_step_end(self, trainer, state):
+            seen.append(state.expert_counts.clone())
+
+    t = _fit(tmp_path, Watch(), train=dict(n_steps=1))
+    *micro, total = seen
+    assert len(micro) == t.cfg.data.grad_accum
+    # The step's reduced counts are the micro-batches summed (dp=1 in this test).
+    assert torch.equal(torch.stack(micro).sum(0), total)
+    assert all(c.shape == total.shape for c in micro)
+
+
+class _Poisoner(Callback):
+    """Makes one step's gradient non-finite, the way a real loss spike would."""
+
+    def __init__(self, at_step):
+        self.at_step = at_step
+
+    def on_microbatch_end(self, trainer, state, micro_step, counts):
+        if state.step == self.at_step and micro_step == trainer.cfg.data.grad_accum - 1:
+            next(iter(trainer.model.parameters())).grad.fill_(float("inf"))
+
+
+def test_a_dropped_step_reaches_on_before_optimizer_step_but_not_on_accepted_step(tmp_path):
+    """The reason `on_accepted_step` exists. A rejected batch must leave the
+    accumulator exactly as it found it, and `on_before_optimizer_step` fires before
+    the trainer knows whether the batch is any good."""
+    cb = _Recorder()
+    cfg = tiny_config(tmp_path, train=dict(n_steps=3))
+    t = Trainer(cfg, callbacks=[cb, _Poisoner(at_step=1)], verbose=False)
+    t.fit()
+    assert "before" in cb.kinds(1) and "accepted" not in cb.kinds(1)
+    assert "accepted" in cb.kinds(0) and "accepted" in cb.kinds(2)
+    assert t.skipped == 1
+
+
+def test_the_final_flush_fires_once_on_a_normal_finish(tmp_path):
+    cb = _Recorder()
+    _fit(tmp_path, cb, train=dict(n_steps=2))
+    assert [e[0] for e in cb.log].count("flush") == 1
+
+
+def test_a_flush_that_moves_the_weights_forces_the_final_eval_to_be_redone(tmp_path):
+    """Otherwise the number the run reports describes the model one update ago."""
+    quiet, moved = _Recorder(flush_moved=False), _Recorder(flush_moved=True)
+    _fit(tmp_path / "a", quiet, train=dict(n_steps=4, eval_every=2))
+    _fit(tmp_path / "b", moved, train=dict(n_steps=4, eval_every=2))
+    assert [e[0] for e in moved.log].count("eval") == \
+        [e[0] for e in quiet.log].count("eval") + 1
+
+
+# ── gradients that are accumulators, not this batch's gradient ───────
+
+class _Registers(Callback):
+    """Registers one expert tensor as an accumulator and shouts into its gradient."""
+
+    def __init__(self, register=True, spike=1e6):
+        self.register, self.spike = register, spike
+        self.p, self.seen = None, []
+
+    def on_train_start(self, trainer):
+        self.p = next(iter(trainer.model.moe_layers())).experts.gate_up_proj
+        if self.register:
+            trainer.grad_accumulators.append(self.p)
+
+    def on_microbatch_end(self, trainer, state, micro_step, counts):
+        if micro_step == trainer.cfg.data.grad_accum - 1:
+            self.p.grad.add_(self.spike)
+
+    def on_accepted_step(self, trainer, state):
+        self.seen.append((state.grad_norm, float(self.p.grad.abs().max())))
+
+
+def test_a_registered_accumulator_is_left_out_of_the_gradient_clip(tmp_path):
+    """Clipping rescales every gradient it is given. On an accumulator that is not
+    clipping a gradient -- it is shrinking a half-filled window, by a different
+    factor each step."""
+    kept = _Registers(register=True)
+    _fit(tmp_path / "kept", kept, train=dict(n_steps=1))
+    norm, biggest = kept.seen[0]
+    assert math.isfinite(norm) and norm < 1e4        # the spike is not in the norm
+    assert biggest >= 1e6                            # ... and was not scaled away
+
+    clipped = _Registers(register=False)
+    _fit(tmp_path / "clipped", clipped, train=dict(n_steps=1))
+    norm, biggest = clipped.seen[0]
+    assert norm > 1e4 and biggest < 1e6              # the baseline does both
+
+
+def test_a_registered_accumulator_survives_the_per_step_clear(tmp_path):
+    """The central mechanic: `p.grad` is the window, so the trainer must not zero
+    it between batches the way it zeroes everything else."""
+    cb = _Registers(register=True, spike=1.0)
+    _fit(tmp_path, cb, train=dict(n_steps=3))
+    maxima = [b for _, b in cb.seen]
+    assert len(maxima) == 3
+    assert maxima[1] > maxima[0] and maxima[2] > maxima[1]
+
+
+def test_nothing_is_registered_by_default_and_the_whole_model_is_clipped(tmp_path):
+    t = _fit(tmp_path, _Recorder(), train=dict(n_steps=1))
+    assert t.grad_accumulators == []
+    assert list(t._clipped_params()) == list(t.model.parameters())

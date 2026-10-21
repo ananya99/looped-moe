@@ -91,6 +91,13 @@ class Trainer:
         # Non-finite steps are dropped, not applied (see train_step).
         self.skipped, self.consecutive_skips = st_skipped, 0
         self._stop_requested = False
+        # Parameters whose `.grad` is a multi-batch accumulator rather than this
+        # batch's gradient, registered by a callback at on_train_start. They are
+        # spared the per-step clear and left out of the gradient-norm clip, because
+        # both would corrupt a window that is still filling. Empty by default, and
+        # the trainer never asks what the accumulation rule is -- see
+        # moestack/expert_accum.py.
+        self.grad_accumulators: list[nn.Parameter] = []
 
         self.train_iter = build_train_iterator(cfg.data, self.args.vocab_size, cfg.train.seed,
                                                d.rank, start=data_start,
@@ -111,10 +118,17 @@ class Trainer:
     def train_step(self) -> StepState:
         cfg, d = self.cfg, self.dist
         accum = cfg.data.grad_accum
-        self.optimizers.zero_grad(set_to_none=True)
+        self.optimizers.zero_grad(set_to_none=True, keep=self.grad_accumulators)
         sums: dict[str, torch.Tensor] = {}
         counts = torch.zeros(self.args.n_layers, self.args.n_experts, dtype=torch.long,
                              device=d.device)
+
+        # Before the micro-batch loop, not after it: a callback that steps part of
+        # the model mid-batch has to see this step's scheduled rate. The value does
+        # not depend on anything the loop computes, so moving it changes nothing.
+        lr = lr_at(self.step, cfg.optim, cfg.train.n_steps)
+        self.optimizers.set_lr(lr)
+        state = StepState(step=self.step, lr=lr)
 
         for i in range(accum):
             inp, tgt = next(self.train_iter)
@@ -128,8 +142,12 @@ class Trainer:
             for t in terms:
                 sums[t.name] = sums.get(t.name, 0.0) + t.value.detach().float() / accum
             sums["total"] = sums.get("total", 0.0) + loss.detach().float() / accum
-            counts += torch.stack([r.counts for r in out.router_outs])
+            micro_counts = torch.stack([r.counts for r in out.router_outs])
+            counts += micro_counts
             del out, terms, loss, inp, tgt  # free the memory before the all_reduce
+            # Fired after the activations are freed, so a callback that steps part
+            # of the model here is not doing it at the peak of the micro-batch.
+            self.callbacks.on_microbatch_end(self, state, i, micro_counts)
 
         # One collective for all scalars, one for the counts. Counts are reduced
         # BEFORE anything is derived from them, so every rank sees the same numbers.
@@ -138,16 +156,14 @@ class Trainer:
         vec = vec / d.world_size
         all_reduce_(counts)
 
-        lr = lr_at(self.step, cfg.optim, cfg.train.n_steps)
-        self.optimizers.set_lr(lr)
-        grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), cfg.optim.grad_clip)
+        grad_norm = nn.utils.clip_grad_norm_(self._clipped_params(), cfg.optim.grad_clip)
 
         values = dict(zip(names, vec.tolist()))
         total = values.pop("total")
         self.tokens_seen += self.tokens_per_step
-        state = StepState(step=self.step, lr=lr, loss_terms=values, grad_norm=float(grad_norm),
-                          expert_counts=counts, tokens_seen=self.tokens_seen,
-                          metrics={"train/loss": total})
+        state.loss_terms, state.grad_norm = values, float(grad_norm)
+        state.expert_counts, state.tokens_seen = counts, self.tokens_seen
+        state.metrics["train/loss"] = total
         self.callbacks.on_before_optimizer_step(self, state)
 
         # Applying a non-finite step poisons the weights, and the next `save()`
@@ -168,8 +184,20 @@ class Trainer:
 
         self.consecutive_skips = 0
         state.metrics["train/skipped_steps"] = self.skipped
+        # Past the drop: anything that moves weights or consumes accumulated state
+        # happens from here, never from on_before_optimizer_step.
+        self.callbacks.on_accepted_step(self, state)
         self.optimizers.step()
         return state
+
+    def _clipped_params(self):
+        """Everything clip_grad_norm_ should see. An accumulator's `.grad` spans
+        several batches, so scaling it would not clip a gradient -- it would shrink
+        a window that is still filling, and differently each time it is visited."""
+        if not self.grad_accumulators:
+            return self.model.parameters()
+        skip = {id(p) for p in self.grad_accumulators}
+        return [p for p in self.model.parameters() if id(p) not in skip]
 
     @torch.no_grad()
     def evaluate(self) -> dict:
@@ -278,6 +306,13 @@ class Trainer:
             # No closing eval: the point is to be gone before the kill lands.
             final = m or {"loss": float("nan"), "perplexity": float("nan")}
         else:
+            # Last chance to close any window still open: after this the weights are
+            # saved and the run is over. A stopped run deliberately does *not* flush
+            # -- its windows are in the checkpoint, and the resumed run continues
+            # them. If the flush moved anything, the eval the last step ran no
+            # longer describes the model, so it is redone.
+            if self.callbacks.on_before_final_eval(self, state):
+                m = None
             final = m or self.evaluate()    # don't re-evaluate if the last step just did
             if m is None:
                 self.callbacks.on_eval(self, state, final)

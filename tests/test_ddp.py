@@ -3,6 +3,10 @@
 1. DDP gradients on two half-batches == single-process gradients on the full batch.
 2. A 2-rank Trainer keeps replicas bit-identical and reduces expert counts over
    the global batch.
+3. Per-expert learning rates are derived identically on every rank.
+4. A gradient used as a multi-batch accumulator survives DDP's bucket: never
+   clearing it still accumulates correctly, and zeroing one expert's slice leaves
+   the rest of the bucket alone.
 """
 
 import os
@@ -156,3 +160,95 @@ def test_per_expert_lr_is_identical_on_every_rank(tmp_path):
     # the rule must have been doing something, or this proves nothing
     assert r["scales"][0].shape[-1] == r["counts"]
     assert not torch.allclose(r["scales"][0], torch.ones_like(r["scales"][0]))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Expert-local accumulation keeps its window in `p.grad` and never clears
+# it between micro-batches. Under DDP that gradient is a *view into the
+# reducer's bucket* (parallelize passes gradient_as_bucket_view=True), so
+# before anything is built on top of it: does a never-zeroed gradient
+# still accumulate correctly, and does writing one expert's slice leave
+# the others alone?
+# ──────────────────────────────────────────────────────────────────────
+
+def _probe_batches(n=3):
+    g = torch.Generator().manual_seed(123)
+    return [torch.randint(0, 256, (4, 16), generator=g) for _ in range(n)]
+
+
+def _bucket_worker(rank, world, port, out_dir):
+    _setup(rank, world, port)
+    from conftest import tiny_args
+    from moestack.config import LossConfig, ParallelConfig
+    from moestack.initialization import init_weights
+    from moestack.losses import compute_loss
+    from moestack.model import Transformer
+    from moestack.parallel import init_distributed, parallelize
+
+    d = init_distributed()
+    cfg = LossConfig(aux_coef=0.0, z_coef=1e-3)
+    batches = _probe_batches()
+
+    def run(zero_slice_after=None):
+        torch.manual_seed(0)
+        model = Transformer(tiny_args())
+        init_weights(model)
+        fwd = parallelize(model, ParallelConfig(), d)
+        expert = next(iter(model.moe_layers())).experts.gate_up_proj
+        running = []
+        for i, x in enumerate(batches):
+            xs, ys = x.chunk(world)[rank], torch.roll(x, -1, 1).chunk(world)[rank]
+            # No no_sync: every micro-batch is reduced, which is what an expert
+            # that may fire mid-batch needs. Nothing is ever zeroed.
+            compute_loss(fwd(xs), ys, cfg)[0].backward()
+            running.append(expert.grad.detach().clone())
+            if i == zero_slice_after:
+                expert.grad[0].zero_()      # expert 0 closes its window here
+        return running, {n: p.grad.detach().clone() for n, p in model.named_parameters()}
+
+    plain, plain_all = run()
+    zeroed, _ = run(zero_slice_after=0)
+    if rank == 0:
+        torch.save({"plain": plain, "zeroed": zeroed, "all": plain_all},
+                   Path(out_dir) / "bucket.pt")
+    dist.destroy_process_group()
+
+
+@pytest.mark.slow
+def test_a_never_zeroed_gradient_still_accumulates_correctly_under_ddp(tmp_path):
+    mp.spawn(_bucket_worker, args=(2, _free_port(), str(tmp_path)), nprocs=2, join=True)
+    r = torch.load(tmp_path / "bucket.pt")
+
+    from conftest import tiny_args
+    from moestack.config import LossConfig
+    from moestack.initialization import init_weights
+    from moestack.losses import compute_loss
+    from moestack.model import Transformer
+    torch.manual_seed(0)
+    model = Transformer(tiny_args())
+    init_weights(model)
+    cfg = LossConfig(aux_coef=0.0, z_coef=1e-3)
+    for x in _probe_batches():
+        compute_loss(model(x), torch.roll(x, -1, 1), cfg)[0].backward()
+
+    # Re-reducing an already-reduced partial sum is a no-op under a mean
+    # all-reduce, so syncing every micro-batch costs communication but changes no
+    # arithmetic: three un-cleared micro-batches equal one single-process run.
+    for n, p in model.named_parameters():
+        torch.testing.assert_close(r["all"][n], p.grad, atol=1e-6, rtol=1e-4, msg=n)
+
+
+@pytest.mark.slow
+def test_closing_one_experts_window_leaves_every_other_experts_untouched(tmp_path):
+    """`p.grad[e].zero_()` writes into the reducer's bucket. If that disturbed its
+    neighbours -- or if the reducer overwrote rather than accumulated afterwards --
+    every expert's window would be wrong in a way nothing would raise."""
+    mp.spawn(_bucket_worker, args=(2, _free_port(), str(tmp_path)), nprocs=2, join=True)
+    r = torch.load(tmp_path / "bucket.pt")
+    plain_final, zeroed_final, after_first = r["plain"][-1], r["zeroed"][-1], r["plain"][0]
+
+    assert torch.equal(zeroed_final[1:], plain_final[1:])
+    # Expert 0 kept exactly what arrived after its reset, and nothing from before.
+    torch.testing.assert_close(zeroed_final[0], plain_final[0] - after_first[0],
+                               atol=1e-6, rtol=1e-4)
+    assert not torch.allclose(zeroed_final[0], plain_final[0])   # the reset did something

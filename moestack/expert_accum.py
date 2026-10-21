@@ -118,9 +118,10 @@ class AccumState:
 
     @classmethod
     def zeros(cls, n_layers: int, n_experts: int, device=None) -> "AccumState":
-        z = lambda fill: torch.full((n_layers, n_experts), fill, dtype=torch.long,  # noqa: E731
-                                    device=device)
-        return cls(z(0), z(0), z(0), z(-1))
+        def filled(value):
+            return torch.full((n_layers, n_experts), value, dtype=torch.long, device=device)
+        # last_event starts at -1: "never", which is distinguishable from step 0.
+        return cls(filled(0), filled(0), filled(0), filled(-1))
 
     @property
     def shape(self):

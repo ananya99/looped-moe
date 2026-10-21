@@ -23,6 +23,7 @@ per-expert anything) is a new rule or a new group attribute, not a code path.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -104,6 +105,26 @@ def default_rules(name: str, split_experts: bool = False) -> list[Rule]:
     raise ValueError(f"unknown optimizer {name!r}")
 
 
+@contextmanager
+def _hidden_grads(params):
+    """Temporarily detach `.grad` from `params` so an optimizer step skips them.
+
+    Both Muon and AdamW skip a parameter whose grad is None, so this is how a
+    partial step leaves the rest of the model alone *without clearing* what it has
+    accumulated. That distinction is the whole point: once `.grad` is being used as
+    a multi-batch accumulator, zeroing it to skip a parameter would throw away the
+    window.
+    """
+    saved = [(p, p.grad) for p in params if p.grad is not None]
+    for p, _ in saved:
+        p.grad = None
+    try:
+        yield
+    finally:
+        for p, g in saved:
+            p.grad = g
+
+
 class Optimizers:
     """Several torch optimizers behind one interface. Each param group carries
     `lr_mult`; `set_lr(base)` sets group lr = base * lr_mult."""
@@ -131,34 +152,57 @@ class Optimizers:
                 out.setdefault(g["layer"], []).append(g)
         return out
 
-    def set_expert_lr_scales(self, scales):
-        """Write per-expert LR multipliers (a `[L, E]` tensor) onto the expert groups.
-
-        One row per layer; both of a layer's expert tensors (gate_up and down) get
-        the same row. Multipliers are *attributes*, not a modified `lr`, so they
-        cannot compound across steps the way `pg["lr"] *= scale` could.
+    def _set_expert_attr(self, key: str, values, what: str):
+        """Write one row per layer of a `[L, E]` tensor onto that layer's expert
+        groups. Both of a layer's expert tensors (gate_up and down) get the same
+        row. These are *attributes*, not a modified `lr`, so they cannot compound
+        across steps the way `pg["lr"] *= scale` could. `values=None` clears the
+        attribute, which restores the unmodified code path inside Muon.
         """
         groups = self.expert_lr_groups()
         if not groups:
             raise RuntimeError(
-                "no per-layer expert param groups: per-expert learning rates need "
+                f"no per-layer expert param groups: {what} needs "
                 "optim.name=muon and rules built with split_experts=True "
                 "(under AdamW the experts stay single 3D tensors and are not "
                 "individually addressable)")
-        if scales.dim() != 2 or scales.size(0) <= max(groups):
-            raise ValueError(f"expected scales [n_layers, n_experts] covering layers "
-                             f"0..{max(groups)}, got {tuple(scales.shape)}")
+        if values is not None and (values.dim() != 2 or values.size(0) <= max(groups)):
+            raise ValueError(f"expected {key} [n_layers, n_experts] covering layers "
+                             f"0..{max(groups)}, got {tuple(values.shape)}")
         for layer, gs in groups.items():
             for g in gs:
-                g["lr_scale"] = scales[layer]
+                g[key] = None if values is None else values[layer]
+
+    def set_expert_lr_scales(self, scales):
+        """Per-expert LR multipliers, a `[L, E]` tensor. See `_set_expert_attr`."""
+        self._set_expert_attr("lr_scale", scales, "per-expert learning rates")
+
+    def set_expert_update_mask(self, mask):
+        """Which experts take a step at all, a `[L, E]` bool tensor (None = all).
+
+        Unlike an `lr_scale` of 0, a False entry also freezes that expert's momentum
+        buffer, which is what lets an expert accumulate gradient over several
+        batches without its buffer decaying while it waits.
+        """
+        if mask is not None and mask.dtype != torch.bool:
+            raise ValueError(f"update mask must be a bool tensor, got {mask.dtype}")
+        self._set_expert_attr("update_mask", mask, "per-expert update masks")
 
     def zero_grad(self, set_to_none: bool = True):
         for o in self.optimizers.values():
             o.zero_grad(set_to_none=set_to_none)
 
-    def step(self):
-        for o in self.optimizers.values():
-            o.step()
+    def step(self, only: str | None = None):
+        """`only="expert"` steps just the groups holding expert tensors and leaves
+        every other parameter's accumulated gradient exactly where it is -- which is
+        what a mid-batch expert event needs, since the shared parameters are still
+        halfway through their own accumulation window."""
+        hidden = ([] if only is None else
+                  [p for g in self.param_groups if only not in g.get("roles", ())
+                   for p in g["params"]])
+        with _hidden_grads(hidden):
+            for o in self.optimizers.values():
+                o.step()
 
     def state_dict(self):
         return {k: o.state_dict() for k, o in self.optimizers.items()}

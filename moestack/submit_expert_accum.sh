@@ -62,11 +62,18 @@ set -euo pipefail
 # EDIT HERE
 # ===================================================================
 CSUB=/Users/ananyagupta/repos/getting-started/csub.py   # cluster wrapper, on this laptop
-REPO_DIR=looped-moe                 # relative to the job's working dir (scratch home)
-VENV=.venv                          # relative to REPO_DIR
+# Overridable from the environment because they are about *where* a run happens,
+# not what it is:  REPO_DIR=looped-moe-accum bash moestack/submit_expert_accum.sh
+# lets this grid run from its own worktree while another branch's jobs keep using
+# the main checkout.
+REPO_DIR="${REPO_DIR:-looped-moe}"  # relative to the job's working dir (scratch home)
+VENV="${VENV:-.venv}"               # relative to REPO_DIR
 
 ARCH=deepseek                       # deepseek | olmoe | qwen3moe
-SCALE=regular                       # tiny | small | regular
+# Also env-overridable, for trials only -- `SCALE=tiny ... --trial mb-r4` is a
+# smoke test on a GPU, not a cell of this grid. The grid is `regular`, and the run
+# name carries the scale either way, so a trial can never be mistaken for a cell.
+SCALE="${SCALE:-regular}"           # tiny | small | regular
 OPTIMIZER=muon                      # accumulation requires muon (it raises under adamw)
 NODE_TYPE=h200
 GPUS=1                              # the mb cells are single-process only

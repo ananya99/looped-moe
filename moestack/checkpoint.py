@@ -58,7 +58,27 @@ def load(path: Path, *, model, optimizers, callbacks) -> dict:
     return ckpt["trainer"]
 
 
+def _step_files(save_dir: Path, run_name: str) -> list[Path]:
+    return sorted(Path(save_dir).glob(f"{run_name}_step*.pt"),
+                  key=lambda p: int(p.stem.rsplit("step", 1)[1]))
+
+
 def latest(save_dir: Path, run_name: str) -> Path | None:
-    ckpts = sorted(Path(save_dir).glob(f"{run_name}_step*.pt"),
-                   key=lambda p: int(p.stem.rsplit("step", 1)[1]))
+    ckpts = _step_files(save_dir, run_name)
     return ckpts[-1] if ckpts else None
+
+
+def prune(save_dir: Path, run_name: str, keep: int) -> list[Path]:
+    """Delete all but the newest `keep` step checkpoints. Returns what went.
+
+    Only `{run_name}_step*.pt`: `best` is a result, not a restart point, and is
+    left alone. `keep < 1` keeps everything, so this is inert until asked for.
+    A file that vanishes under us (two ranks, a stale NFS handle) is not an error
+    -- the point was for it to be gone.
+    """
+    if keep < 1:
+        return []
+    doomed = _step_files(save_dir, run_name)[:-keep]
+    for p in doomed:
+        p.unlink(missing_ok=True)
+    return doomed

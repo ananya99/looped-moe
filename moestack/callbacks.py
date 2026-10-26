@@ -262,9 +262,15 @@ class ExpertAccumulation(Callback):
       reading -- each expert has its own clock -- but it is a real difference from
       the baseline, not an implementation detail.
 
-    Not resumable, deliberately: the open windows are in the gradient buffers,
-    which `checkpoint.py` does not write. `config.py` refuses the combination
-    rather than restoring token counts without the gradients they stand for.
+    **Resumable, by discarding.** The window *counters* are checkpointed; the
+    gradient they stand for is not, because it lives in `p.grad` and writing it
+    would add the entire expert gradient to every checkpoint -- making the save
+    slower, which is exactly backwards for a run that is being preempted. So a
+    resumed run restores the event history and drops every open window, the same
+    move `discard()` makes for a non-finite batch. The cost is bounded: at most
+    `max_window` ticks of partial gradient per expert, once per resume, counted as
+    `accum/resumes` so it is visible rather than silent. An uninterrupted run is
+    unaffected -- nothing here runs unless a checkpoint was loaded.
     """
 
     def __init__(self, cfg, every: int = 0, path=None):
@@ -273,6 +279,10 @@ class ExpertAccumulation(Callback):
         self._fired, self._accepted, self._off = None, False, None
         self.tally = None
         self.discarded, self.nonfinite_micro = 0, 0
+        # Resume bookkeeping. `_resumed` is the checkpointed state waiting to be
+        # applied: load_state_dict runs in Trainer.__init__, before on_train_start
+        # has built self.state or found the expert tensors, so it can only stash.
+        self._resumed, self.resumes, self.resume_dropped = None, 0, 0
         # Per-event records. Per-expert series are far too wide for wandb, so the
         # joint distribution goes to a file on a cadence and the dashboard gets
         # the aggregates -- the same split as ExpertStats.
@@ -304,6 +314,7 @@ class ExpertAccumulation(Callback):
         trainer.grad_accumulators.extend(p for pair in self.experts for p in pair)
         self.state = AccumState.zeros(args.n_layers, args.n_experts,
                                       device=trainer.dist.device)
+        self._restore(trainer)
         self._off = torch.zeros_like(self.state.pending, dtype=torch.bool)
         self.tally = EventTally(args.n_layers * args.n_experts)
         per_tick = trainer.tokens_per_step
@@ -316,6 +327,31 @@ class ExpertAccumulation(Callback):
             print(f"  expert accumulation: clock={self.cfg.clock} Q={self.threshold} "
                   f"D={self.cfg.max_window} grad_scale={self.cfg.grad_scale} "
                   f"({balanced:,.0f} tokens/expert/tick at perfect balance)")
+
+    def _restore(self, trainer):
+        """Apply a checkpointed state, dropping whatever windows were open.
+
+        `events` and `last_event` survive -- the record of what actually updated is
+        still true, and `accum/event_gini` would otherwise restart from zero at
+        every preemption and read as a step change in the metric. `pending` and
+        `age` do not: their gradient is not in the checkpoint, and carrying the
+        counts without it would scale the next event's gradient by tokens that are
+        no longer there.
+        """
+        if self._resumed is None:
+            return
+        sd = self._resumed
+        self._resumed = None
+        self.state.load_state_dict(sd["accum"])
+        self.discarded = sd.get("discarded", 0)
+        self.nonfinite_micro = sd.get("nonfinite_micro", 0)
+        self.resumes = sd.get("resumes", 0) + 1
+        dropped = int((self.state.pending > 0).sum())
+        self.resume_dropped = sd.get("resume_dropped", 0) + dropped
+        self.state.discard()
+        if trainer.verbose:
+            print(f"  expert accumulation: resumed (#{self.resumes}); dropped "
+                  f"{dropped} open window(s), kept the event history")
 
     # -- the cycle -----------------------------------------------------
     def on_microbatch_end(self, trainer, state, micro_step, counts, loss):
@@ -363,6 +399,12 @@ class ExpertAccumulation(Callback):
                 self._fired = None
             state.metrics.update(accum_metrics(self.state, self.tally, self.threshold))
             state.metrics["accum/discarded_windows"] = self.discarded
+            if self.resumes:
+                # How much of this run's history is a restart, and how much
+                # accumulation it cost. A cell with many resumes is not directly
+                # comparable to one with none.
+                state.metrics["accum/resumes"] = self.resumes
+                state.metrics["accum/resume_dropped_windows"] = self.resume_dropped
             if self.cfg.clock == "microbatch":
                 state.metrics["accum/nonfinite_microbatches"] = self.nonfinite_micro
             if self.threshold:
@@ -449,6 +491,19 @@ class ExpertAccumulation(Callback):
             for p in pair:
                 if p.grad is not None:
                     p.grad.zero_()
+
+    # -- checkpointing -------------------------------------------------
+    def state_dict(self):
+        if self.state is None:      # never started; nothing to say
+            return {}
+        return {"accum": self.state.state_dict(), "discarded": self.discarded,
+                "nonfinite_micro": self.nonfinite_micro, "resumes": self.resumes,
+                "resume_dropped": self.resume_dropped}
+
+    def load_state_dict(self, sd):
+        # Stash only: this runs from Trainer.__init__, before on_train_start has
+        # built self.state. `_restore` applies it once there is something to apply.
+        self._resumed = sd or None
 
 
 class ExpertStats(Callback):

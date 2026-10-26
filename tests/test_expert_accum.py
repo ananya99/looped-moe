@@ -676,6 +676,7 @@ def test_nothing_is_registered_by_default_and_the_whole_model_is_clipped(tmp_pat
 
 from moestack.callbacks import ExpertAccumulation                # noqa: E402
 from moestack.config import Config                               # noqa: E402
+from moestack import checkpoint                                  # noqa: E402
 
 
 def _accum_cfg(tmp_path, steps=3, **accum):
@@ -859,8 +860,6 @@ def test_accumulation_under_adamw_fails_at_startup(kw, match):
     (dict(threshold=1, clock="hourly"), {}, "clock must be"),
     (dict(threshold=1, grad_scale="median"), {}, "grad_scale must be"),
     (dict(threshold=1, max_window=0), {}, "at least 1 tick"),
-    (dict(threshold=1), dict(auto_resume=True), "not resumable"),
-    (dict(threshold=1), dict(resume="x.pt"), "not resumable"),
 ])
 def test_an_ill_defined_accumulation_run_fails_at_startup(accum, train, match):
     cfg = Config()
@@ -1089,4 +1088,178 @@ def test_the_events_cadence_does_not_change_a_run_name(tmp_path):
     a = _accum_cfg(tmp_path, threshold=100)
     b = _accum_cfg(tmp_path, threshold=100)
     b.logging.accum_events_every = 25
+    assert a.run_name() == b.run_name()
+
+
+# ── resume ───────────────────────────────────────────────────────────
+#
+# Cluster jobs are preempted, and an accumulation run cannot be continued the way
+# the baseline is: the open windows live in `p.grad`, which checkpoint.py does not
+# write. Restoring the token counts without them would scale the next event's
+# gradient by tokens that are no longer there, so a resumed run drops the open
+# windows and keeps only the event history.
+
+# Chosen against the tiny config's real load: after two steps an expert holds
+# ~50-210 tokens, so this fires the hot ones and leaves the cold ones open --
+# which is exactly the state a preemption has to be tested against.
+RESUME_Q = 100
+
+
+def _accum_cb(trainer):
+    return next(c for c in trainer.callbacks.callbacks
+                if isinstance(c, ExpertAccumulation))
+
+
+def _train_cfg(tmp_path, steps, train=None, **accum):
+    """`_accum_cfg` forwards every keyword to `expert_accum`; these go to `train`."""
+    cfg = _accum_cfg(tmp_path, steps=steps, **accum)
+    for k, v in (train or {}).items():
+        setattr(cfg.train, k, v)
+    return cfg
+
+
+def _checkpoint_at(tmp_path, step, **accum):
+    """Train `step` steps, save, and return the trainer holding the live state."""
+    cfg = _accum_cfg(tmp_path, steps=step, **accum)
+    t = Trainer(cfg, verbose=False)
+    t.callbacks.on_train_start(t)
+    while t.step < step:
+        t.callbacks.on_step_end(t, t.train_step())
+        t.step += 1
+    t.save(f"step{step}")
+    return t
+
+
+def test_an_accumulation_run_may_now_resume(tmp_path):
+    """The refusal in config.py is gone: both resume flags compose with accum."""
+    for train in (dict(auto_resume=True), dict(resume="x.pt")):
+        cfg = Config()
+        cfg.optim.expert_accum.enabled = True
+        cfg.optim.expert_accum.threshold = 1
+        for k, v in train.items():
+            setattr(cfg.train, k, v)
+        cfg.__post_init__()         # no raise
+
+
+def test_resume_drops_the_open_windows_and_keeps_the_event_history(tmp_path):
+    """The two halves of the contract, in one run.
+
+    `pending`/`age` must come back at zero -- their gradient is not in the file --
+    while `events`/`last_event` must survive, or `accum/event_gini` would restart
+    from zero at every preemption and read as a step change in the metric.
+    """
+    # A threshold low enough that events happen, high enough that windows are
+    # still open when the checkpoint is written.
+    first = _checkpoint_at(tmp_path, 2, threshold=RESUME_Q)
+    before = _accum_cb(first)
+    assert int((before.state.pending > 0).sum()), "need an open window to drop"
+    events_before = before.state.events.clone()
+    assert int(events_before.sum()), "need some history to keep"
+
+    cfg = _accum_cfg(tmp_path, steps=4, threshold=RESUME_Q)
+    cfg.train.resume = str(Path(first.save_dir) / f"{first.run_name}_step2.pt")
+    second = Trainer(cfg, verbose=False)
+    second.callbacks.on_train_start(second)
+    after = _accum_cb(second)
+
+    assert int(after.state.pending.sum()) == 0 and int(after.state.age.sum()) == 0
+    torch.testing.assert_close(after.state.events, events_before)
+    torch.testing.assert_close(after.state.last_event, before.state.last_event)
+
+
+def test_resume_counts_itself_so_the_discard_is_visible(tmp_path):
+    """A cell resumed twenty times is not comparable to one resumed never, so the
+    count and the windows it cost are metrics rather than a silent correction."""
+    first = _checkpoint_at(tmp_path, 2, threshold=RESUME_Q)
+    dropped = int((_accum_cb(first).state.pending > 0).sum())
+
+    cfg = _accum_cfg(tmp_path, steps=4, threshold=RESUME_Q)
+    cfg.train.resume = str(Path(first.save_dir) / f"{first.run_name}_step2.pt")
+    second = Trainer(cfg, verbose=False)
+    second.fit()
+    cb = _accum_cb(second)
+    assert cb.resumes == 1 and cb.resume_dropped == dropped
+
+    # ... and they reach wandb through the step metrics.
+    state = StepState(step=0)
+    cb._accepted = True
+    cb.on_step_end(second, state)
+    assert state.metrics["accum/resumes"] == 1
+    assert state.metrics["accum/resume_dropped_windows"] == dropped
+
+
+def test_an_uninterrupted_run_is_untouched_by_the_resume_path(tmp_path):
+    """Nothing in `_restore` runs without a checkpoint, so the finished cells stay
+    comparable to resumed ones: no resume metrics, and no discards."""
+    t = _accum_fit(tmp_path, steps=3, threshold=RESUME_Q)
+    cb = _accum_cb(t)
+    assert cb.resumes == 0 and cb.resume_dropped == 0
+    state = StepState(step=0)
+    cb._accepted = True
+    cb.on_step_end(t, state)
+    assert "accum/resumes" not in state.metrics
+
+
+def test_a_resumed_run_still_reaches_the_right_step_and_data_position(tmp_path):
+    """The rest of the checkpoint is unaffected by the accumulation state: the
+    resumed run picks up the step counter and the data stream where it left off."""
+    first = _checkpoint_at(tmp_path, 2, threshold=RESUME_Q)
+    cfg = _accum_cfg(tmp_path, steps=4, threshold=RESUME_Q)
+    cfg.train.resume = str(Path(first.save_dir) / f"{first.run_name}_step2.pt")
+    second = Trainer(cfg, verbose=False)
+    assert second.step == 2
+    assert second.train_iter.consumed == 2 * cfg.data.grad_accum
+    second.fit()
+    assert second.step == 4
+
+
+# ── checkpoint retention ─────────────────────────────────────────────
+#
+# Surviving preemption means saving often, and a full-state checkpoint is ~59 GB
+# at `regular` scale. Without a retention bound the grid fills the scratch quota
+# long before it finishes -- which is how one cell reached 438 GB of files it
+# could not resume from.
+
+def test_keep_last_n_prunes_old_step_checkpoints(tmp_path):
+    cfg = _train_cfg(tmp_path, 4, dict(save_every=1, keep_last_n=2),
+                     threshold=RESUME_Q)
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    left = sorted(p.name for p in Path(t.save_dir).glob(f"{t.run_name}_step*.pt"))
+    assert left == [f"{t.run_name}_step3.pt", f"{t.run_name}_step4.pt"]
+
+
+def test_pruning_leaves_the_checkpoint_auto_resume_would_pick(tmp_path):
+    """The newest file is always kept, so retention can never strand a run."""
+    cfg = _train_cfg(tmp_path, 4, dict(save_every=1, keep_last_n=1),
+                     threshold=RESUME_Q)
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    found = checkpoint.latest(Path(t.save_dir), t.run_name)
+    assert found is not None and found.exists()
+    assert found.name == f"{t.run_name}_step4.pt"
+
+
+def test_retention_is_off_by_default(tmp_path):
+    cfg = _train_cfg(tmp_path, 3, dict(save_every=1), threshold=RESUME_Q)
+    assert cfg.train.keep_last_n == 0
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    assert len(list(Path(t.save_dir).glob(f"{t.run_name}_step*.pt"))) == 3
+
+
+def test_retention_does_not_touch_the_best_checkpoint(tmp_path):
+    cfg = _train_cfg(tmp_path, 4, dict(save_every=1, keep_last_n=1, eval_every=1),
+                     threshold=RESUME_Q)
+    t = Trainer(cfg, verbose=False)
+    t.fit()
+    assert (Path(t.save_dir) / f"{t.run_name}_best.pt").exists()
+
+
+def test_retention_stays_out_of_the_run_name(tmp_path):
+    """It is housekeeping, not an experiment: two runs differing only in it are
+    the same cell and must share a checkpoint prefix."""
+    a = _accum_cfg(tmp_path, threshold=RESUME_Q)
+    b = _accum_cfg(tmp_path, threshold=RESUME_Q)
+    b.train.keep_last_n = 3
     assert a.run_name() == b.run_name()

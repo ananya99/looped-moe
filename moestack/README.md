@@ -201,13 +201,14 @@ so seeds of one cell plot together.
 | LM loss positions | `labels=input_ids` → HF scores T−1 positions per sequence | scores all T using `targets` | uses the token `data.py` already provides; ≈0.05 % more targets |
 | Balance-loss top-k | re-runs top-k on probs cast to the autocast dtype | uses the router's own fp32 top-k | identical in fp32; avoids picking a different expert on bf16 near-ties |
 | Muon on experts | one 2D proxy `Parameter` per expert + grad copy every step | batched Newton–Schulz on the 3D tensor | same math per matrix (tested vs `torch.optim.Muon`, ≤1 bf16 ulp), no proxies or Python loop over experts |
-| Resume | replays the stream | replays the stream (`stream`), seeks instantly (`disk`, `synthetic`); restores RNG + callback state | resume is bit-identical to an uninterrupted run (tested) |
+| Resume | replays the stream | replays the stream (`stream`), seeks instantly (`disk`, `synthetic`); restores RNG + callback state | resume is bit-identical to an uninterrupted run (tested) — with one documented exception: under `optim.expert_accum` the in-flight accumulation windows are reset to zero, see [Limits](#limits) |
 | Data delivery | HF streaming only: ~50 min of shuffle-buffer filling before step 0, and a stuck worker hangs the run with no timeout | `data.source=disk` memory-maps a cache built once by `prepare_data` | measured: ~65 % of a 300-step run's wall clock was the stream, none of it compute |
 | Eval cadence | after step index 500, 1000, … | after 500, 1000, … completed steps | off-by-one cleanup |
 | LM loss memory | one-shot `logits.float()` → ~20 GB held, ~33 GB peak at B=16/T=2048/V=100k | `loss.lm_chunk_rows` (4096) chunks it, each chunk's fp32 cast and log-softmax recomputed in backward | same value and gradient; ~10 GB peak, which is what caps batch size at this vocab |
 | Non-finite step | applied, then the run raises | dropped (`train/skipped_steps`), run aborts after `train.max_consecutive_skips` in a row | a NaN step poisons the weights *and* the next checkpoint before anything notices |
 | Eval scoring | `cross_entropy` without `ignore_index`, divided by `targets.numel()` | the same `lm_cross_entropy_sum` training uses | train and eval cannot drift on which positions count |
-| SIGTERM | killed where it lands, losing up to `save_every` steps | checkpoints at the next step boundary and exits; a second signal kills immediately | `submit_moestack_runs.sh` caps each job with `timeout`, so this is the normal way a long run ends |
+| SIGTERM | killed where it lands, losing up to `save_every` steps | checkpoints at the next step boundary and exits; a second signal kills immediately | `submit_moestack_runs.sh` caps each job with `timeout`, so this is the normal way a long run ends. It does **not** help against RunAI preemption: the grace period is 30 s, less than one `regular` step, let alone a 59 GB save — only periodic checkpoints survive that |
+| Checkpoint retention | every `_step*.pt` kept forever | `train.keep_last_n` prunes all but the newest N after each save (`best` and the newest are never pruned) | a cadence that survives preemption writes ~20 files a run; at 59 GB each that is 1.2 TB per cell |
 | Run name | a curated list of flags; changing batch size, grad accum, seq len or n_steps silently reused another run's checkpoints | `condition_name()` carries a fingerprint of **every** learning-relevant field that differs from the defaults | new options are part of a run's identity by default and must be excluded on purpose |
 
 Checkpoints are `moestack-v1` files (not HF state dicts). For `eval_downstream.py`, convert with
@@ -224,7 +225,7 @@ Checkpoints are `moestack-v1` files (not HF state dicts). For `eval_downstream.p
 | `test_ddp.py` | 2-process gloo: DDP grads = single-process full-batch grads; replicas stay identical; expert counts are summed over ranks; per-expert multipliers and EMA are byte-identical on every rank; a never-cleared gradient still accumulates through the reducer's bucket, and zeroing one expert's slice leaves the rest of it alone |
 | `test_per_expert_lr.py` | the LR rule vs the original `compute_lr_scales`; `lr_scale` in Muon = per-expert LRs; alpha=0 and splitting groups change nothing bit-for-bit; config validation and run names; resume keeps a warm EMA |
 | `test_stats.py` | gini decomposition, Spearman tie handling and NaN, per-layer series, the JSONL's shape and cadence |
-| `test_expert_accum.py` | the window rule (threshold, timeout, dead experts, overshoot); Muon's `update_mask` incl. an all-true mask being bit-identical to none; the trainer's new events and accumulator handling; both clocks end to end, and that they agree bit-for-bit at `grad_accum=1` |
+| `test_expert_accum.py` | the window rule (threshold, timeout, dead experts, overshoot); Muon's `update_mask` incl. an all-true mask being bit-identical to none; the trainer's new events and accumulator handling; both clocks end to end, and that they agree bit-for-bit at `grad_accum=1`; **resume drops the open windows and keeps the event history**; `keep_last_n` retention |
 
 Not covered here (needs a GPU): bf16 autocast numerics, CUDA `grouped_mm`, NCCL. First
 thing to run on the cluster: a short `deepseek-tiny` run next to an `imbalance_train.py`
@@ -353,9 +354,52 @@ bash moestack/submit_expert_accum.sh --dry        # the 10-cell grid
 
 ### Limits
 
-**Not resumable.** The open windows live in the gradient buffers, which
-`checkpoint.py` does not write, so `train.resume` / `train.auto_resume` are refused
-at startup rather than restoring token counts without the gradients they stand for.
+**Resume works, but the accumulated gradient is reset to zero.** A resumed run
+picks up the weights, the optimizer state, the step counter and the data position
+exactly, like any other run — but every expert's *in-flight accumulation window*
+is thrown away and restarted empty. An expert that was 80 % of the way to its
+token budget when the checkpoint was written begins the resumed run at 0 %.
+
+Why: the window's gradient is `p.grad`, which `checkpoint.py` does not write. It
+is not small — the accumulated gradient is one number per expert weight, so at
+`regular` scale it is **6,442,450,944 values = 25.8 GB**, as large as the expert
+weights themselves. Saving it would take every checkpoint from 59 GB to 84 GB and
+the save from ~5 min to ~7 min, which is backwards for a run that is being
+preempted. Nor can it be summarised: `pending` is a token *count* (a scalar per
+expert, which is why that part is cheap to save), while the gradient is a
+6.29 M-dimensional direction per expert, and at Q ≈ 50–100 k tokens against a
+2048-dim matrix every window is full rank, so there is nothing to truncate.
+
+So on load the counters are restored and then zeroed, instead of carrying token
+counts whose gradient is gone. That second part is the point: restoring
+`pending = 90,000` into a process whose `p.grad` is empty would make the next
+event divide a 3,000-token gradient by 90,000 and fire a window built from the
+wrong tokens, with nothing raising. Zeroing keeps the bookkeeping and the
+gradient consistent.
+
+| On resume | What happens to it |
+|---|---|
+| model weights, Muon momentum, step, data position, RNG | restored exactly |
+| `events`, `last_event` (what already fired) | **kept** — else `accum/event_gini` restarts at 0 and reads as a step change |
+| `pending`, `age` (the open window) | **reset to 0** |
+| `p.grad` (the accumulated gradient) | **gone** — never written, now never claimed to exist |
+
+The cost is bounded: at most `max_window` ticks of partial gradient per expert,
+once per resume — well under 1 % of a 2000-step cell even after twenty restarts.
+Both halves are reported, **`accum/resumes`** and
+**`accum/resume_dropped_windows`**, because a cell resumed twenty times has given
+up measurably more accumulation than one resumed never: check those two series
+before comparing cells. An uninterrupted run is unaffected — none of this path
+runs without a checkpoint to load, so the cells that finish in one attempt stay
+bit-identical to how they would have run before resume existed.
+
+This matters because the H200 pool preempts: the first batch of
+`submit_expert_accum.sh` lost 72 of 76 attempts, median 1.8 h against the ~18 h a
+cell needs. Evicted pods are *deleted and recreated*, so `--backofflimit` does not
+cap the churn, and the 30 s grace period is far too short to reach a step boundary
+and write a 59 GB file — the graceful SIGTERM path never fired once. Periodic
+`save_every` checkpoints are the only thing that survives, which is why the submit
+script now sets `save_every=100`, `keep_last_n=2` and `auto_resume=true`.
 
 **`clock=microbatch` is single-process.** The trainer runs all but the last
 micro-batch under `no_sync`, so mid-batch an expert's gradient is one rank's alone

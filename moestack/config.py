@@ -216,6 +216,13 @@ class TrainConfig:
     log_every: int = 10
     eval_every: int = 500
     save_every: int = 500
+    # How many `_step*.pt` files to keep, newest first (0 = keep every one, the
+    # original behaviour). A full-state checkpoint is the model plus the optimizer
+    # state -- ~59 GB at `regular` scale -- so a run that saves often enough to
+    # survive preemption fills a scratch quota long before it finishes. `best` is
+    # never pruned, and neither is the newest step file, which is what
+    # `auto_resume` loads.
+    keep_last_n: int = 0
     save_dir: str = "checkpoints"
     resume: Optional[str] = None
     auto_resume: bool = False
@@ -261,7 +268,7 @@ _MISSING = object()
 _NAME_IGNORE_SECTIONS = ("logging",)
 _NAME_IGNORE_FIELDS = {
     "train": ("save_dir", "resume", "auto_resume", "device", "log_every", "eval_every",
-              "save_every", "dry_run", "max_consecutive_skips", "seed"),
+              "save_every", "keep_last_n", "dry_run", "max_consecutive_skips", "seed"),
     "data": ("num_workers", "eval_batches", "cache_dir"),
     "parallel": ("compile", "activation_checkpointing"),
     "loss": ("lm_chunk_rows",),
@@ -334,15 +341,13 @@ class Config:
             if ea.max_window is not None and ea.max_window < 1:
                 raise ValueError(f"optim.expert_accum.max_window must be at least 1 "
                                  f"tick, got {ea.max_window}")
-            if self.train.resume or self.train.auto_resume:
-                # An open window lives in `p.grad`, which checkpoint.py does not
-                # write (it would roughly double the expert half of every file).
-                # Resuming would restore the token counts without the gradients they
-                # stand for, so it is refused rather than silently wrong.
-                raise ValueError("optim.expert_accum runs are not resumable: the open "
-                                 "windows are in the gradient buffers, which are not "
-                                 "checkpointed. Run uninterrupted, or clear "
-                                 "train.resume / train.auto_resume")
+            # Resume is allowed. An open window lives in `p.grad`, which
+            # checkpoint.py does not write -- storing it would add the whole expert
+            # gradient to every file and make the save slower, which is the opposite
+            # of what a preempted run needs. So ExpertAccumulation discards the open
+            # windows on load instead (the same move it makes for a non-finite
+            # batch) and reports it as `accum/resumes`. Event history survives; at
+            # most `max_window` ticks of partial gradient per expert do not.
 
     def significant_overrides(self) -> dict:
         """{dotted key: value} for every learning-relevant field that differs from

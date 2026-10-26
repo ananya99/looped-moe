@@ -37,10 +37,23 @@
 #      grad_accum -- otherwise "16" means 16 steps on one clock and one step on
 #      the other.
 #
-# NO AUTO-RESUME. The open windows live in the gradient buffers, which are not
-# checkpointed, so config.py refuses train.auto_resume. A cell that exhausts its
-# wall-clock budget is lost rather than continued: give TIME margin, and treat a
-# 124 exit as a cell to rerun from the start.
+# AUTO-RESUME IS ON, and a cell needs it: the H200 pool preempts, and the first
+# batch of this grid lost 72 of 76 attempts that way (median 1.8 h, against the
+# ~18 h a cell takes). Pods are deleted and recreated rather than restarted, so
+# --backofflimit does not cap it and SIGTERM never reaches the trainer -- the
+# 30 s grace period is far too short to reach a step boundary and write a 59 GB
+# checkpoint, so periodic saves are the only thing that survives.
+#
+# What a resume costs: the open windows live in the gradient buffers and are NOT
+# checkpointed, so they are dropped on load and every expert restarts its window
+# empty (`accum/resumes` and `accum/resume_dropped_windows` say how often and how
+# many). The event history carries over. A cell with many resumes has lost a
+# little accumulated gradient that one with none has not -- check those two
+# series before comparing cells. moestack/README.md "Limits" has the reasoning.
+#
+# Hence SAVE_EVERY is low and KEEP_LAST is set: a save costs ~5 min of the
+# ~53 min it now buys back, and without retention 20 saves x 59 GB would be
+# 1.2 TB per cell.
 #
 # Compare cells on train/lm_loss, never train/loss -- the baseline has aux 0.01
 # and the rest have 0, so only the pure cross-entropy is comparable.
@@ -70,10 +83,10 @@ REPO_DIR="${REPO_DIR:-looped-moe}"  # relative to the job's working dir (scratch
 VENV="${VENV:-.venv}"               # relative to REPO_DIR
 
 ARCH=deepseek                       # deepseek | olmoe | qwen3moe
-# Also env-overridable, for trials only -- `SCALE=tiny ... --trial mb-r4` is a
-# smoke test on a GPU, not a cell of this grid. The grid is `regular`, and the run
-# name carries the scale either way, so a trial can never be mistaken for a cell.
-SCALE="${SCALE:-regular}"           # tiny | small | regular
+# Edit here, not from the command line. The grid is `regular`; drop to `tiny` for
+# a smoke test on a GPU and put it back afterwards. The run name carries the scale
+# either way, so a trial can never be mistaken for a cell.
+SCALE=regular                       # tiny | small | regular
 OPTIMIZER=muon                      # accumulation requires muon (it raises under adamw)
 NODE_TYPE=h200
 GPUS=1                              # the mb cells are single-process only
@@ -102,13 +115,17 @@ esac
 AUX_BASELINE=0.01                   # the balanced reference cell's aux coefficient
 STATS_EVERY=50                      # per-expert drift JSONL cadence; 0 disables
 EVENTS_EVERY=50                     # accumulation events JSONL cadence; 0 disables
-SAVE_EVERY=250
+# ~53 min of training between saves, so a preemption costs ~26 min on average
+# instead of the whole cell. Each save is ~5 min, so this is ~9% overhead -- the
+# price of the pool being preemptible.
+SAVE_EVERY=100
+KEEP_LAST=2                         # 59 GB a file; keep the resume point and one spare
 
 RELS="2 4 8"                        # Q, in multiples of a balanced expert's load
 D_STEP=16                           # staleness cap on the step clock, in steps
 
-TIME=30h                            # no resume, so one attempt has to finish a cell
-BACKOFF=1                           # ... and a retry would restart from zero anyway
+TIME=30h                            # per attempt; auto-resume carries a cell across several
+BACKOFF=1                           # inert here: evicted pods are recreated, not retried
 # ===================================================================
 
 JOB_PREFIX=ea                       # k8s job names: <prefix>-<name>-<batch>
@@ -142,6 +159,7 @@ COMMON=(
     "data.batch_size=$BATCH_SIZE" "data.grad_accum=$GRAD_ACCUM"
     "train.n_steps=$N_STEPS" "train.seed=$SEED"
     "logging.expert_stats_every=$STATS_EVERY" "train.save_every=$SAVE_EVERY"
+    "train.keep_last_n=$KEEP_LAST"
     "logging.load_stats_per_layer=true"
     "parallel.activation_checkpointing=$ACT_CKPT"
 )
@@ -175,7 +193,8 @@ to_seconds () {   # 12h | 45m | 2d6h30m | 3600 -> seconds (same grammar as csub.
 
 run () {   # [NOTES=..] [RESUME=1] run <name> <extra hydra overrides...>
     local base="$1"; shift
-    local notes="${NOTES:-}" resume="${RESUME:-0}"
+    # Resume by default now that accumulation runs support it: RESUME=0 opts out.
+    local notes="${NOTES:-}" resume="${RESUME:-1}"
     local secs; secs="$(to_seconds "$TIME")"   # validated before anything is submitted
     local job
     job="$(echo "$JOB_PREFIX-$base-$BATCH" | tr '[:upper:]' '[:lower:]' \

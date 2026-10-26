@@ -236,6 +236,13 @@ class Trainer:
                         callbacks=self.callbacks, config=self.cfg.to_dict())
         if self.verbose:
             print(f"  -> {path}")
+        # After the write, never before: a crash mid-save must not leave the run
+        # with the new file missing and the old ones already deleted.
+        if name.startswith("step"):
+            for gone in checkpoint.prune(self.save_dir, self.run_name,
+                                         self.cfg.train.keep_last_n):
+                if self.verbose:
+                    print(f"  -- pruned {gone.name}")
 
     # ------------------------------------------------------------------
     @contextmanager
@@ -313,9 +320,9 @@ class Trainer:
         else:
             # Last chance to close any window still open: after this the weights are
             # saved and the run is over. A stopped run deliberately does *not* flush
-            # -- its windows are in the checkpoint, and the resumed run continues
-            # them. If the flush moved anything, the eval the last step ran no
-            # longer describes the model, so it is redone.
+            # -- it is racing a kill, and the resumed run drops those windows anyway.
+            # If the flush moved anything, the eval the last step ran no longer
+            # describes the model, so it is redone.
             if self.callbacks.on_before_final_eval(self, state):
                 m = None
             final = m or self.evaluate()    # don't re-evaluate if the last step just did

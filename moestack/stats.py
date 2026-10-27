@@ -152,6 +152,42 @@ def summarize(x: torch.Tensor, name: str, mask: torch.Tensor | None = None) -> d
     return out
 
 
+def routing_moments(router_outs, top_k: int) -> torch.Tensor:
+    """`[3]` of (entropy, confidence, margin), meaned over tokens and layers.
+
+    How *decisively* the router assigns, which is a different axis from how
+    *evenly* it assigns: a router can be perfectly confident per token and
+    perfectly balanced over experts (it sends 1/E of tokens to each, each one
+    certainly), or maximally unsure per token and still badly imbalanced. The
+    `load/*` metrics cannot see this, including the normalised count entropy that
+    used to live there -- that is the entropy of the assignment *histogram*, not of
+    the router's per-token distribution.
+
+    - `entropy`    mean over tokens of H(softmax(logits)), in **nats, unnormalised**,
+                   to be directly comparable with published numbers (Compass
+                   2610.04140 Fig. 3c reports 0.786-1.02 nats at E=8; the ceiling is
+                   log E, so 4.159 at E=64). Divide by log E for a [0, 1] version.
+    - `confidence` mean top-1 probability.
+    - `margin`     mean gap between the k-th and (k+1)-th probability: how close the
+                   router came to picking a different expert. Small margins mean the
+                   assignment is unstable even when the entropy looks settled.
+
+    Computed from the full softmax, not the renormalised top-k weights: that is what
+    the router z-loss acts on (it penalises logsumexp of these logits), so it is the
+    distribution whose shape the z-loss coefficient is actually controlling.
+    """
+    ents, confs, margins = [], [], []
+    for r in router_outs:
+        p = r.logits.detach().float().softmax(-1)
+        ents.append(-(p * p.clamp(min=1e-12).log()).sum(-1).mean())
+        top = p.topk(min(top_k + 1, p.size(-1)), dim=-1).values
+        confs.append(top[:, 0].mean())
+        margins.append((top[:, top_k - 1] - top[:, top_k]).mean()
+                       if top.size(-1) > top_k else top.new_zeros(()))
+    return torch.stack([torch.stack(ents).mean(), torch.stack(confs).mean(),
+                        torch.stack(margins).mean()])
+
+
 def load_metrics(counts: torch.Tensor) -> dict:
     """Routing-balance metrics from exact global-batch counts `[L, E]`.
 
@@ -168,18 +204,27 @@ def load_metrics(counts: torch.Tensor) -> dict:
     c = counts.float()
     if c.dim() == 1:
         c = c.unsqueeze(0)
-    ginis, deads = [], []
+    ginis, deads, vios = [], [], []
     for row in c:
         if row.sum() <= 0:
             continue
         ginis.append(gini(row))
         deads.append(float((row == 0).float().mean()))
+        mean = row.mean().clamp(min=1e-9)
+        vios.append(float((row.max() - mean) / mean))
     if not ginis:
         return {}
     n = len(ginis)
     return {
         "load/gini": sum(ginis) / n,
         "load/dead_expert_fraction": sum(deads) / n,
+        # MaxVio (Wang et al. 2024, as reported by ExpertMuon-Compass 2610.04140
+        # Fig. 3b): the relative excess load of the most-used expert, averaged over
+        # the MoE layers. **Zero means an even load** -- which is why it is
+        # `max/mean - 1` and not `max/mean`. Kept despite being a function of the
+        # counts, because it is the one load number directly comparable with
+        # published figures; Compass reports it falling ~0.2 -> ~0.05 over training.
+        "load/maxvio": sum(vios) / n,
     }
 
 

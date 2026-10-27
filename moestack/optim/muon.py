@@ -107,6 +107,12 @@ class Muon(Optimizer):
                         nesterov=nesterov, ns_steps=ns_steps, eps=eps,
                         lr_scale=None, update_mask=None)
         super().__init__(params, defaults)
+        # Read-only measurement hook: `probe(p, idx, grad, update)` is called with
+        # the orthogonalized direction, which exists nowhere else -- it is a local
+        # inside `_apply` and is consumed by the weight update. Nothing here may
+        # modify the update; `compass.py` is the one consumer. None = zero cost.
+        self.probe = None
+        self._orthogonalized = None
         for g in self.param_groups:
             for p in g["params"]:
                 if p.dim() not in (2, 3):
@@ -123,6 +129,7 @@ class Muon(Optimizer):
         buf.lerp_(grad, 1 - mom)
         update = grad.lerp(buf, mom) if g["nesterov"] else buf
         update = zeropower_via_newtonschulz(update, g["ns_steps"], g["eps"])
+        self._orthogonalized = update       # the only point O_e exists; see `probe`
         if s is None:
             dst.mul_(1 - lr * wd)
             dst.add_(update, alpha=-adjusted_lr(lr, dst.shape))
@@ -162,14 +169,22 @@ class Muon(Optimizer):
                     # parameter at lr=0 did in the original trainer. An `update_mask`
                     # is what stops the buffer instead.
                     self._apply(p, p.grad, buf, g, lr, wd, mom, s)
+                    if self.probe is not None:
+                        self.probe(p, None, p.grad, self._orthogonalized)
                     continue
                 idx = _mask_indices(mask, p)
                 if idx.numel() == 0:
                     continue
                 sub_p = p.data.index_select(0, idx)
                 sub_buf = buf.index_select(0, idx)
-                self._apply(sub_p, p.grad.index_select(0, idx), sub_buf, g, lr, wd, mom,
+                sub_grad = p.grad.index_select(0, idx)
+                self._apply(sub_p, sub_grad, sub_buf, g, lr, wd, mom,
                             None if s is None else s.index_select(0, idx))
+                if self.probe is not None:
+                    # `idx` says which experts these rows are: under accumulation
+                    # only the experts that fired take a step, and those are exactly
+                    # the ones whose alignment is worth measuring.
+                    self.probe(p, idx, sub_grad, self._orthogonalized)
                 p.data.index_copy_(0, idx, sub_p)
                 buf.index_copy_(0, idx, sub_buf)
         return loss

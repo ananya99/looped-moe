@@ -825,7 +825,7 @@ def test_a_dropped_batch_throws_away_every_open_window(tmp_path):
 def test_accumulation_is_off_by_default_and_changes_no_run_name():
     cfg = Config()
     assert not cfg.optim.expert_accum.enabled
-    assert "acc" not in cfg.run_name().split("-lr")[1]
+    assert "acc" not in cfg.run_name()
 
 
 def test_the_trainer_only_builds_the_callback_when_it_is_enabled(tmp_path):
@@ -998,10 +998,12 @@ def test_the_step_clock_is_still_allowed_under_ddp(tmp_path):
     t.callbacks.on_train_start(t)                    # does not raise
 
 
-def test_the_microbatch_clocks_budget_is_read_per_microbatch(tmp_path):
-    """threshold_rel means 'this many ticks of a balanced expert's load', and a
-    tick is a micro-batch here -- so the same setting is grad_accum times smaller
-    than on the step clock. The two cells are only comparable at a fixed Q."""
+def test_the_same_threshold_rel_is_the_same_budget_on_both_clocks(tmp_path):
+    """threshold_rel counts multiples of a balanced expert's load per optimizer
+    *step*, on either clock. Read per *tick* instead -- a micro-batch on one clock
+    and a step on the other -- the same setting would be two different experiments,
+    which is why the paired cells used to need an absolute token count on the mb
+    side and so could not share a run name with their st partner."""
     per_clock = {}
     for clock in ("step", "microbatch"):
         t = Trainer(_accum_cfg(tmp_path / clock, steps=1, threshold_rel=2.0, clock=clock),
@@ -1009,7 +1011,13 @@ def test_the_microbatch_clocks_budget_is_read_per_microbatch(tmp_path):
         t.callbacks.on_train_start(t)
         acc = next(c for c in t.callbacks.callbacks if isinstance(c, ExpertAccumulation))
         per_clock[clock] = acc.threshold
-    assert per_clock["step"] == per_clock["microbatch"] * 2      # tiny_config: accum=2
+    assert per_clock["step"] == per_clock["microbatch"]
+
+
+def test_paired_cells_share_a_readable_budget_in_their_names(tmp_path):
+    a = _accum_cfg(tmp_path, threshold_rel=4.0, clock="step").run_name()
+    b = _accum_cfg(tmp_path, threshold_rel=4.0, clock="microbatch").run_name()
+    assert "accstr4" in a and "accmbr4" in b
 
 
 def test_the_two_clocks_get_different_names():

@@ -36,6 +36,7 @@ import torch
 from .expert_accum import (AccumState, EventTally, accum_metrics, grad_scale,
                            resolve_threshold)
 from .expert_lr import ema_update, lr_scales_from_counts, scale_summary
+from .compass import expert_scale
 from .grad_stats import ExpertGradMoments, accumulated_grad_sq
 from .stats import (delta_norms, drift_metrics, gini, load_metrics, row_norms,
                     summarize)
@@ -271,6 +272,7 @@ class ExpertAccumulation(Callback):
     def __init__(self, cfg, every: int = 0, path=None):
         self.cfg = cfg
         self.state, self.threshold, self.experts = None, None, []
+        self._last_tokens = None
         self._fired, self._accepted, self._off = None, False, None
         self.tally = None
         self.discarded, self.nonfinite_micro = 0, 0
@@ -315,8 +317,17 @@ class ExpertAccumulation(Callback):
         per_tick = trainer.tokens_per_step
         if self.cfg.clock == "microbatch":
             per_tick //= trainer.cfg.data.grad_accum
+        # `threshold_rel` resolves against the per-STEP balanced load on **both**
+        # clocks, not the per-tick one. A tick is a micro-batch on the mb clock and
+        # a step on the st clock, so a per-tick reading made `threshold_rel=4` two
+        # different experiments depending on the clock -- which is why the mb cells
+        # used to pass an absolute token count instead, and why their run names read
+        # `q49152` while the paired st cells read `r4`. Per-step units make the pair
+        # name-identical and the conversion unnecessary. No-op for the st clock,
+        # where a tick already is a step.
         self.threshold = resolve_threshold(self.cfg.threshold, self.cfg.threshold_rel,
-                                           per_tick, args.top_k, args.n_experts)
+                                           trainer.tokens_per_step,
+                                           args.top_k, args.n_experts)
         if trainer.verbose:
             balanced = per_tick * args.top_k / args.n_experts
             print(f"  expert accumulation: clock={self.cfg.clock} Q={self.threshold} "
@@ -362,10 +373,17 @@ class ExpertAccumulation(Callback):
         event = self._close_windows(trainer, counts, state.step, tick=micro_step)
         if not event.any:
             return
-        self._close_grad_windows(trainer, event.fire)
+        # `_close_windows` already opened the event (it has to, before `_arm`
+        # rescales the gradients). Closing it after the step is what captures the
+        # displacement -- the only point at which it is observable under this
+        # clock, since by the end of the step `on_accepted_step` has masked the
+        # experts off and a step-level before/after sees exactly zero.
         # Only the experts: the shared parameters are still filling their own
         # window and must keep the gradient they have accumulated so far.
         trainer.optimizers.step(only="expert")
+        sink = self._grad_sink(trainer)
+        if sink is not None:
+            sink.close_event(trainer, event.fire)
         self._zero(event.fire)
 
     def on_before_optimizer_step(self, trainer, state):
@@ -381,6 +399,8 @@ class ExpertAccumulation(Callback):
             return
         if state.expert_counts is None:
             return
+        # `_close_windows` opens the event; the trainer steps right after this
+        # returns, and `on_step_end` closes it.
         self._fired = self._close_windows(trainer, state.expert_counts,
                                           state.step).fire
 
@@ -391,6 +411,9 @@ class ExpertAccumulation(Callback):
             self.discarded += 1
         else:
             if self._fired is not None:
+                sink = self._grad_sink(trainer)
+                if sink is not None:
+                    sink.close_event(trainer, self._fired)
                 self._zero(self._fired)     # the step clock steps inside the trainer
                 self._fired = None
             state.metrics.update(accum_metrics(self.state, self.tally))
@@ -413,30 +436,41 @@ class ExpertAccumulation(Callback):
             return False
         tokens = self.state.consume(event.fire, trainer.step)
         self.tally.add(event, tokens)
+        sink = self._grad_sink(trainer)
+        if sink is not None:
+            sink.open_event(trainer, event.fire, tokens)     # before the rescale
         self._arm(trainer, event, tokens)
         self._record(trainer.step, 0, event, tokens, reason="flush")
         trainer.optimizers.step(only="expert")
+        if sink is not None:
+            sink.close_event(trainer, event.fire)
         self._zero(event.fire)
         trainer.optimizers.set_expert_update_mask(None)
         return True
 
     # -- plumbing ------------------------------------------------------
-    def _close_grad_windows(self, trainer, fire):
-        """Tell `ExpertGradStats` which experts just stepped, so their gradient
-        window restarts here. Without this an accumulated expert's SNR would be
-        measured over the micro-batches of the whole step rather than the ones that
-        actually fed its update -- which is the quantity the experiment is about."""
-        cb = next((c for c in trainer.callbacks.callbacks
-                   if isinstance(c, ExpertGradStats)), None)
-        if cb is not None:
-            cb.close_fired(trainer, fire)
+    def _grad_sink(self, trainer):
+        """`ExpertGradStats`, if it is running. It owns the per-event record; this
+        callback only says when an event begins and ends."""
+        return next((c for c in trainer.callbacks.callbacks
+                     if isinstance(c, ExpertGradStats) and c.moments is not None), None)
 
     def _close_windows(self, trainer, counts, step, tick=0):
         """observe -> decide -> consume -> arm the optimizer. Returns the event."""
         self.state.observe(counts)
         event = self.state.ready(self.threshold, self.cfg.max_window)
         tokens = self.state.consume(event.fire, step)
+        self._last_tokens = tokens      # the window's token budget, for the sink
         self.tally.add(event, tokens)
+        # Before `_arm`, which rescales the firing gradients in place by
+        # 1/tokens. `ExpertGradStats` compares the accumulated gradient against the
+        # raw per-micro-batch norms its hooks recorded, so reading `p.grad` after
+        # the rescale divides one side of that ratio and not the other -- SNR then
+        # comes out ~tokens times too small, and only under accumulation, which is
+        # what made a baseline and a Q=1 step clock disagree on identical windows.
+        sink = self._grad_sink(trainer)
+        if sink is not None and event.any:
+            sink.open_event(trainer, event.fire, tokens)
         self._arm(trainer, event, tokens)
         self._record(step, tick, event, tokens)
         return event
@@ -513,30 +547,40 @@ class ExpertAccumulation(Callback):
 
 
 class ExpertStats(Callback):
-    """How far each expert actually moved, next to how many tokens it saw.
+    """How far each expert actually got, over a **fixed interval**, next to how many
+    tokens it saw over the same interval.
 
-    Per-expert series are far too wide for wandb (64 experts x 16 layers = 1024
-    series per quantity), so the dashboard gets the correlations and the full joint
-    distribution goes to `<save_dir>/<run_name>_expert_stats.jsonl`, one record per
-    measured step. That file is what an offline analysis of "does token count
-    predict learning" is computed from.
+    Brackets the reporting interval, not a single optimizer step: a snapshot at step
+    N and another at step N+`every`. Three reasons, in order of importance:
 
-    The measurement brackets the optimizer step: a snapshot of the expert tensors
-    at `on_before_optimizer_step`, the difference at `on_step_end`. Snapshots go to
-    host memory -- at `regular` scale the expert weights are a sizeable fraction of
-    a GPU, and this runs on a cadence precisely because it is not free.
+    1. **It is correct under every clock.** Under `clock=microbatch` the experts
+       move *inside* the micro-batch loop and `on_accepted_step` then masks them
+       off, so a step-level before/after brackets an interval in which nothing
+       happens and reports exactly zero. An interval diff does not care when inside
+       it the movement happened.
+    2. **No composition bias.** Every expert gets the same interval whether it fired
+       once or fifty times, so the population is fixed and the series is directly
+       comparable with a baseline run. Aggregating per-event displacements instead
+       would weight hot experts by how often they fire -- which is the very thing an
+       intervention changes.
+    3. **It is the quantity that carries the signal.** Under Muon a single update is
+       nearly a fixed size, so per-event displacement says little; what varies is the
+       *rate*, and only an interval measurement integrates firing rate.
 
-    Steps the trainer *drops* (non-finite loss or grad norm) are skipped rather
-    than recorded: no optimizer step ran, so every drift would be exactly zero and
-    the correlation would be meaningless rather than absent.
+    This is **net displacement**, not path length: updates that partly cancel show
+    less motion than aligned ones. That is the right number for "how far did it get"
+    and the wrong one for "how much did it move" -- path length is the sum of
+    `rel_update` over the expert's events, in the grad-events JSONL.
+
+    Snapshots go to host memory, which is why this runs on a cadence at all.
     """
 
     def __init__(self, every: int, path=None):
         self.every, self.path = every, path
         self._before = None
+        self._counts = None
         self._fh = None
 
-    # -- plumbing ------------------------------------------------------
     def _experts(self, trainer):
         return [(m.experts.gate_up_proj, m.experts.down_proj)
                 for m in trainer.model.moe_layers()]
@@ -544,36 +588,37 @@ class ExpertStats(Callback):
     def _due(self, step):
         return self.every > 0 and step % self.every == 0
 
+    def _snapshot(self, trainer):
+        # .to("cpu") also detaches the copy from the GPU allocator, so the peak is
+        # one transfer rather than a second resident copy of the expert weights.
+        return [(g.detach().to("cpu", copy=True), d.detach().to("cpu", copy=True))
+                for g, d in self._experts(trainer)]
+
     def on_train_start(self, trainer):
         if self.every > 0 and self.path is None:
             self.path = Path(trainer.save_dir) / f"{trainer.run_name}_expert_stats.jsonl"
 
-    def on_before_optimizer_step(self, trainer, state):
+    def on_step_end(self, trainer, state):
+        if self.every <= 0 or state.expert_counts is None:
+            return
+        # Token share over the same interval as the displacement, so the two sides
+        # of `corr_share_vs_update` describe the same stretch of training. Pairing
+        # one step's counts with a window that opened ten steps ago was the other
+        # way this metric went wrong under accumulation.
+        c = state.expert_counts.cpu()
+        self._counts = c.clone() if self._counts is None else self._counts + c
         if not self._due(state.step):
             return
-        # .to("cpu") also detaches the copy from the GPU allocator, so the peak is
-        # one transfer rather than a second resident copy of the expert weights.
-        self._before = [(g.detach().to("cpu", copy=True), d.detach().to("cpu", copy=True))
-                        for g, d in self._experts(trainer)]
-
-    def on_step_end(self, trainer, state):
-        before, self._before = self._before, None
-        if before is None or state.expert_counts is None:
-            return
-        if not (math.isfinite(state.grad_norm)
-                and math.isfinite(state.metrics.get("train/loss", float("nan")))):
-            return                      # the trainer dropped this step; nothing moved
-        after = [(g.detach().to("cpu", copy=True), d.detach().to("cpu", copy=True))
-                 for g, d in self._experts(trainer)]
+        before, self._before = self._before, self._snapshot(trainer)
+        counts, self._counts = self._counts, None
+        if before is None:
+            return              # first reporting step: an interval needs two ends
+        after = self._before
         d_gate = torch.stack([delta_norms(b[0], a[0]) for b, a in zip(before, after)])
         d_down = torch.stack([delta_norms(b[1], a[1]) for b, a in zip(before, after)])
-        # One number per expert: the norm of its whole step, both matrices together.
         drift = (d_gate.square() + d_down.square()).sqrt()
-        counts = state.expert_counts.cpu()
         w_gate = torch.stack([row_norms(a[0]) for a in after])
         w_down = torch.stack([row_norms(a[1]) for a in after])
-        # Matched to how `drift` is formed above -- both matrices as one vector per
-        # expert -- so ||dw||/||w|| is a ratio of like for like.
         w_norm = (w_gate.square() + w_down.square()).sqrt()
         state.metrics.update(drift_metrics(counts, drift, weights=w_norm))
 
@@ -581,8 +626,7 @@ class ExpertStats(Callback):
             scales = [g["lr_scale"] for layer, gs in
                       sorted(trainer.optimizers.expert_lr_groups().items()) for g in gs[:1]]
             self._write({
-                "step": state.step,
-                "lr": state.lr,
+                "step": state.step, "lr": state.lr, "interval": self.every,
                 "counts": counts.tolist(),
                 "drift": drift.tolist(),
                 "drift_gate_up": d_gate.tolist(),
@@ -591,19 +635,7 @@ class ExpertStats(Callback):
                 "weight_norm_down": w_down.tolist(),
                 "lr_scale": [s.tolist() for s in scales] if scales and scales[0] is not None
                             else None,
-                **self._grad_fields(trainer),
             })
-
-    def _grad_fields(self, trainer) -> dict:
-        """The `[L, E]` gradient-quality matrices, when `ExpertGradStats` measured
-        this same step. It runs first (see `Trainer`), so its `last` is this step's.
-        Absent rather than null when the two cadences disagree, so a reader never
-        mistakes a skipped measurement for a measured NaN."""
-        cb = next((c for c in trainer.callbacks.callbacks
-                   if isinstance(c, ExpertGradStats)), None)
-        if cb is None or cb.last is None or not cb._due(trainer.step):
-            return {}
-        return {f"grad_{k}": v.tolist() for k, v in cb.last.items()}
 
     def _write(self, record: dict):
         if self._fh is None:
@@ -619,47 +651,54 @@ class ExpertStats(Callback):
 
 
 class ExpertGradStats(Callback):
-    """`grad/snr` and `grad/expert_norm`: is an expert's update signal, or noise
-    that happened not to cancel?
+    """Per-expert update quality on the **event** clock, reported on a cadence.
 
-    See `grad_stats` for the identity and for why it costs two `[L, E]` arrays
-    rather than a copy of every expert gradient. This callback is only the clock --
-    and the clock is the whole subtlety.
+    `grad/snr` asks whether the micro-gradients that fed one update agreed with each
+    other (see `grad_stats` for the identity). The window *is* the unit: pooling
+    micro-gradients across several windows would mix in the gradient changing
+    because the weights moved between them, which is gradient non-stationarity, not
+    noise. So the measurement clock is forced and only the reporting clock is free.
 
-    **A window is measured at the moment it closes, not at the step boundary.**
-    Those coincide for a baseline run, where every expert steps once per optimizer
-    step on the `grad_accum` micro-batches it just saw. They do not coincide under
-    expert-local accumulation: an expert's window can span several steps (step
-    clock) or end part-way through one (micro-batch clock). Measuring everything at
-    the step boundary would divide a gradient accumulated over three steps by the
-    micro-batch count of the last one, and report the ratio as an SNR.
+    Two rules follow, and getting either wrong corrupts the metric silently:
 
-    So `ExpertAccumulation` calls `close_fired` with the experts that just fired,
-    each window is measured and reset there, and `on_step_end` closes whatever the
-    controller does not own.
+    1. **The bookkeeping runs continuously.** Window boundaries belong to
+       `ExpertAccumulation`, which fires, steps and zeroes gradients on every step
+       whether or not this callback is reporting. If measurement skipped off-cadence
+       steps, `sumsq` would retain micro-batches whose gradient had been zeroed away
+       and the ratio would be between two different intervals.
+    2. **Aggregate per expert first, then over experts.** At a reporting step the
+       events that closed are a biased sample -- hot experts fire far more often --
+       so pooling events directly would weight them fifty to one, and that weighting
+       would move with any intervention that changes firing rates. Averaging within
+       an expert first gives every expert one vote.
 
-    **A baseline step is still a window**, of `grad_accum` micro-batches. That is
-    the point: without it the SNR-versus-window-tokens curve -- the figure the
-    accumulation experiment exists to produce -- would have no left-hand anchor
-    showing what the intervention moved.
+    An expert that fired zero times in the interval reports NaN, which `summarize`
+    masks out. Read `grad/snr` next to `accum/events_per_expert`, which says how many
+    events backed each mean.
 
-    Measured on a cadence, and the hooks are armed only on measured steps, so a
-    large cadence is genuinely free on the others. Per-expert series are too wide
-    for wandb, so the dashboard gets `stats.summarize` and the `[L, E]` matrices
-    ride along in the JSONL `ExpertStats` writes.
+    A baseline step is itself one window of `grad_accum` micro-batches, which is what
+    anchors the SNR-versus-window-tokens curve at the un-accumulated end.
     """
 
-    FIELDS = ("snr", "grad_norm", "micro")
+    # field in the event record -> metric namespace it is published under
+    FIELDS = {"snr": "grad/snr", "grad_norm": "grad/expert_norm",
+              "rel_update": "update/rel", "per_token": "update/per_token"}
 
-    def __init__(self, every: int):
-        self.every = every
+    def __init__(self, every: int, path=None):
+        self.every, self.path = every, path
         self.moments = None
-        self.last = None                # [L, E] matrices of the windows closed this step
-        self._buf = None
-        self._external_clock = False    # True once ExpertAccumulation owns the clock
+        self.last = None
+        self._sum = self._n = None      # [L, E] running per-expert accumulators
+        self._pending = None            # weights snapshot between open/close
+        self._external = False
+        self._fh = None
 
     def _due(self, step):
         return self.every > 0 and step % self.every == 0
+
+    def _experts(self, trainer):
+        return [(m.experts.gate_up_proj, m.experts.down_proj)
+                for m in trainer.model.moe_layers()]
 
     def on_train_start(self, trainer):
         if self.every <= 0:
@@ -667,94 +706,236 @@ class ExpertGradStats(Callback):
         L, E = trainer.args.n_layers, trainer.args.n_experts
         self.moments = ExpertGradMoments(L, E, device=trainer.dist.device)
         self.moments.attach(trainer.model.moe_layers())
-        self._external_clock = any(isinstance(c, ExpertAccumulation)
-                                   for c in trainer.callbacks.callbacks)
-        self._fresh_buffer(L, E)
-        # Armed a step ahead, never inside one: the hooks fire during backward, and
-        # `on_microbatch_end` only runs once that backward is over. A step is
-        # measured or it is not, and that is decided before its first micro-batch.
-        self._set_armed(trainer.step)
+        self.moments.arm()              # permanently: see rule 1 above
+        self._external = any(isinstance(c, ExpertAccumulation)
+                             for c in trainer.callbacks.callbacks)
+        self._fresh(L, E)
+        if self.path is None:
+            self.path = Path(trainer.save_dir) / f"{trainer.run_name}_grad_events.jsonl"
 
-    def _fresh_buffer(self, L, E):
-        nan = torch.full((L, E), float("nan"))
-        self._buf = {"snr": nan.clone(), "grad_norm": nan.clone(),
-                     "micro": torch.zeros(L, E, dtype=torch.long)}
-
-    def _set_armed(self, step):
-        if self.moments is None:
-            return
-        self.moments.arm() if self._due(step) else self.moments.disarm()
+    def _fresh(self, L, E):
+        self._sum = {k: torch.zeros(L, E) for k in self.FIELDS}
+        self._n = {k: torch.zeros(L, E) for k in self.FIELDS}
 
     def on_microbatch_end(self, trainer, state, micro_step, counts, loss):
-        if self.moments is not None and self._due(state.step):
+        # Registered before ExpertAccumulation, so this tick lands before the
+        # controller closes any window that this micro-batch fed.
+        if self.moments is not None:
             self.moments.tick()
 
-    # -- measuring -----------------------------------------------------
-    def _measure(self, trainer, fire):
-        """Record and reset the windows `fire` selects. Called once per closing,
-        from whichever clock closed it."""
-        if self.moments is None or not self._due(trainer.step):
+    # -- the event -----------------------------------------------------
+    def open_event(self, trainer, fire, tokens=None, grad_correction=1.0):
+        """Called with the experts whose window just closed, *before* they step:
+        the gradients are complete and the weights have not moved yet.
+
+        `grad_correction` divides out anything that rescaled `p.grad` after the
+        hooks saw the micro-gradients. SNR compares the accumulated gradient
+        against the raw per-micro-batch norms, so a factor applied to one side and
+        not the other is pure error -- and both of the things that do this are
+        global, so neither carries information about within-window agreement.
+        """
+        if self.moments is None:
             return
-        grad_sq = accumulated_grad_sq(trainer.model.moe_layers())
-        m = self.moments.close(grad_sq, world_size=trainer.dist.world_size)
         sel = fire.cpu().bool()
-        for k in self.FIELDS:
-            self._buf[k][sel] = m[k].cpu()[sel]
+        grad_sq = accumulated_grad_sq(trainer.model.moe_layers())
+        if grad_correction != 1.0:
+            grad_sq = grad_sq * (grad_correction ** 2)      # grad_sq is a *squared* norm
+        m = self.moments.close(grad_sq, world_size=trainer.dist.world_size)
+        idx = sel.nonzero(as_tuple=False)
+        rows = {(int(l), int(e)): None for l, e in idx}
+        pairs = self._experts(trainer)
+        for (l, e) in rows:
+            g, d = pairs[l]
+            rows[(l, e)] = (g.detach()[e].float().clone(),
+                            d.detach()[e].float().clone(),
+                            float(g.detach()[e].float().norm() ** 2
+                                  + d.detach()[e].float().norm() ** 2) ** 0.5)
+        self._pending = (sel, m, rows, None if tokens is None else tokens.cpu())
+
+    def close_event(self, trainer, fire):
+        """Called after those experts stepped: completes the record and restarts
+        their gradient windows."""
+        if self.moments is None or self._pending is None:
+            return
+        sel, m, rows, tokens = self._pending
+        self._pending = None
+        pairs = self._experts(trainer)
+        for (l, e), (g0, d0, w0) in rows.items():
+            g, d = pairs[l]
+            dw = float(((g.detach()[e].float() - g0).norm() ** 2
+                        + (d.detach()[e].float() - d0).norm() ** 2) ** 0.5)
+            rel = dw / w0 if w0 > 0 else float("nan")
+            tok = None if tokens is None else float(tokens[l, e])
+            rec = {"snr": float(m["snr"][l, e]), "grad_norm": float(m["grad_norm"][l, e]),
+                   "rel_update": rel,
+                   # The quantity that makes windows of different length
+                   # commensurable, and the thesis's actual question: does a bigger
+                   # window buy a proportionally bigger step, or the same step in a
+                   # better direction?
+                   "per_token": (rel / tok if tok else float("nan"))}
+            for k, v in rec.items():
+                if v == v:                      # not NaN
+                    self._sum[k][l, e] += v
+                    self._n[k][l, e] += 1
+            if self._fh is not None or self.path is not None:
+                self._write({"step": trainer.step, "layer": l, "expert": e,
+                             "tokens": tok, "micro": int(m["micro"][l, e]), **rec})
         self.moments.reset(fire)
 
-    def close_fired(self, trainer, fire):
-        """`ExpertAccumulation`, for the experts whose window it just closed."""
-        self._measure(trainer, fire)
+    def _write(self, record):
+        if self._fh is None:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self._fh = Path(self.path).open("a")
+        self._fh.write(json.dumps(record) + "\n")
 
+    # -- the baseline clock --------------------------------------------
     def on_before_optimizer_step(self, trainer, state):
-        """The last moment the accumulated gradients are both complete and
-        unapplied. Under the step clock the controller has not yet decided, so
-        every still-open window is measured here and the controller's `close_fired`
-        only resets; under the micro-batch clock the fired windows were already
-        measured inside the loop and what is left is genuinely still filling."""
-        if self.moments is None or not self._due(state.step):
+        if self.moments is None or self._external:
             return
-        if not self._external_clock:
-            self._measure(trainer, torch.ones_like(self.moments.micro, dtype=torch.bool))
-
-    def on_accepted_step(self, trainer, state):
-        # After ExpertAccumulation's own on_accepted_step (it is registered first),
-        # so the step-clock windows it just closed are measured with the gradients
-        # that fed them, before `optimizers.step()` runs.
-        if self._external_clock and self.moments is not None and self._due(state.step):
-            fired = getattr(self._owner(trainer), "_fired", None)
-            if fired is not None:
-                self._measure(trainer, fired)
-
-    def _owner(self, trainer):
-        return next((c for c in trainer.callbacks.callbacks
-                     if isinstance(c, ExpertAccumulation)), None)
+        # A baseline window *is* the step, so the step's counts are its token
+        # budget. Supplying them is what makes `update/per_token` comparable
+        # between a baseline cell and an accumulated one -- which is the whole
+        # point of the metric, and it would silently be NaN here otherwise.
+        #
+        # The correction undoes gradient clipping. Only the baseline needs it:
+        # `Trainer._clipped_params` deliberately excludes the expert tensors once
+        # they are accumulators, so under accumulation nothing rescaled them, while
+        # here `clip_grad_norm_` already shrank every expert gradient by a global
+        # factor that the hooks never saw.
+        clip = trainer.cfg.optim.grad_clip
+        coef = 1.0
+        if clip and math.isfinite(state.grad_norm):
+            # Mirrors torch.nn.utils.clip_grad_norm_, which scales by
+            # max_norm / (total_norm + 1e-6) and only when that is below 1.
+            coef = min(1.0, clip / (state.grad_norm + 1e-6))
+        self.open_event(trainer, torch.ones_like(self.moments.micro, dtype=torch.bool),
+                        state.expert_counts,
+                        grad_correction=(1.0 / coef) if coef > 0 else 1.0)
 
     def on_step_end(self, trainer, state):
         if self.moments is None:
             return
-        if self._due(state.step):
-            self.last = {k: v.clone() for k, v in self._buf.items()}
-            snr, gnorm = self.last["snr"], self.last["grad_norm"]
-            state.metrics.update(summarize(snr, "grad/snr", mask=torch.isfinite(snr)))
-            # Split on aliveness: the hypothesis is about cold experts, and a dead
-            # one contributes no gradient at all, so leaving them in would drag the
-            # median of the experts that actually stepped.
-            alive = ((state.expert_counts > 0).cpu() if state.expert_counts is not None
-                     else torch.ones_like(gnorm, dtype=torch.bool))
-            state.metrics.update(summarize(gnorm, "grad/expert_norm",
-                                           mask=alive & torch.isfinite(gnorm)))
-            self._fresh_buffer(*self._buf["snr"].shape)
-        if not self._external_clock:
-            # A dropped step still consumed its micro-batches; carrying their
-            # gradients into the next window would measure a mixture of the two.
-            self.moments.reset()
-        self._set_armed(state.step + 1)
+        if not self._external:
+            self.close_event(trainer, torch.ones_like(self.moments.micro, dtype=torch.bool))
+        if self._fh is not None:
+            self._fh.flush()
+        if not self._due(state.step):
+            return
+        # Stage one: per expert, the mean over its events in this interval.
+        self.last = {k: torch.where(self._n[k] > 0, self._sum[k] / self._n[k].clamp(min=1),
+                                    torch.full_like(self._sum[k], float("nan")))
+                     for k in self.FIELDS}
+        self.last["events"] = self._n["snr"].clone()
+        for k, name in self.FIELDS.items():     # stage two: over experts
+            v = self.last[k]
+            state.metrics.update(summarize(v, name, mask=torch.isfinite(v)))
+        self._fresh(*self._sum["snr"].shape)
 
     def on_train_end(self, trainer, state):
         if self.moments is not None:
             self.moments.detach()
             self.moments = None
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+class CompassStats(Callback):
+    """Compass alignment factors (arXiv:2610.04140), measured but **not applied**.
+
+    Does the step Muon is about to take agree with the gradient it came from? Muon
+    normalises the update's singular values, so a poorly-aligned expert still moves
+    about as far as a well-aligned one -- and alignment degrades exactly when the
+    tokens routed to an expert change while its momentum still reflects the old
+    ones, which is this project's premise reached from the optimizer side.
+
+    Pairs with `ExpertGradStats`: SNR asks whether an expert's gradient is
+    trustworthy, alignment asks whether the update agrees with it. A cold expert can
+    be bad on both counts for different reasons.
+
+    `compass/scale` is `c_e * alpha_e`, the multiplier Compass *would* apply. It is
+    only logged here, so no run's trajectory changes and this is safe to switch on
+    mid-grid. The paper reports it spanning ~0.55-0.7 (smallest) to ~1.05-1.10
+    (largest), with the mean rising toward 1.0 as the schedule decays.
+
+    The measurement rides Muon's `probe` hook, which fires inside `_apply` where the
+    orthogonalized direction exists; see `optim/muon.py`.
+    """
+
+    def __init__(self, every: int):
+        self.every = every
+        self.slot = {}          # id(param) -> (layer, which matrix)
+        self.buf = None
+        self.last = None
+        self._lam = 1.0
+        self._alive = None
+
+    def _due(self, step):
+        return self.every > 0 and step % self.every == 0
+
+    def on_train_start(self, trainer):
+        if self.every <= 0:
+            return
+        muon = trainer.optimizers.optimizers.get("muon")
+        if muon is None:
+            raise RuntimeError("CompassStats needs optim.name=muon: the factors are "
+                               "cosines against Muon's orthogonalized direction, "
+                               "which AdamW never forms")
+        for li, moe in enumerate(trainer.model.moe_layers()):
+            for wi, prm in enumerate((moe.experts.gate_up_proj, moe.experts.down_proj)):
+                self.slot[id(prm)] = (li, wi)
+        self._fresh(trainer.args.n_layers, trainer.args.n_experts)
+        muon.probe = self._record
+
+    def _fresh(self, L, E):
+        nan = torch.full((L, E), float("nan"))
+        # Two families per layer -- gate_up and down are separate families in the
+        # paper, since a family is one projection matrix across the layer's experts.
+        self.buf = {k: [nan.clone(), nan.clone()]
+                    for k in ("alignment", "family", "radius", "scale")}
+
+    def _record(self, p, idx, grad, update):
+        """Muon's probe. Read-only: it must not touch `update`."""
+        slot = self.slot.get(id(p))
+        if slot is None or update is None or p.dim() != 3:
+            return              # attention / router matrices are not expert families
+        layer, which = slot
+        alive = None if self._alive is None else (
+            self._alive[layer] if idx is None else self._alive[layer][idx.cpu()])
+        out = expert_scale(update, grad, self._lam, alive=alive)
+        rows = slice(None) if idx is None else idx.cpu()
+        for k, v in out.items():
+            self.buf[k][which][layer, rows] = v.detach().cpu().float()
+
+    def on_before_optimizer_step(self, trainer, state):
+        # lam = lr / peak_lr, so the row factors relax to 1 as the schedule decays.
+        self._lam = state.lr / max(trainer.cfg.optim.lr, 1e-12)
+        self._alive = (None if state.expert_counts is None
+                       else (state.expert_counts > 0).cpu())
+        if not self._due(state.step):
+            trainer.optimizers.optimizers["muon"].probe = None
+        else:
+            trainer.optimizers.optimizers["muon"].probe = self._record
+
+    def on_step_end(self, trainer, state):
+        if self.buf is None or not self._due(state.step):
+            return
+        self.last = {k: torch.stack(v) for k, v in self.buf.items()}   # [2, L, E]
+        for k, v in self.last.items():
+            # Over every expert *matrix*, as the paper does (its Fig. 3a spans "the
+            # 96 expert matrices"), laid out [L, 2E] rather than [2L, E] so that
+            # `argmax_layer` is a real layer index and `outlier_fraction` -- which
+            # `summarize` judges per row -- is judged per layer. `argmax_expert` is
+            # then `family * n_experts + expert`, family 0 = gate_up, 1 = down.
+            flat = v.permute(1, 0, 2).reshape(v.size(1), -1)
+            state.metrics.update(summarize(flat, f"compass/{k}",
+                                           mask=torch.isfinite(flat)))
+        self._fresh(trainer.args.n_layers, trainer.args.n_experts)
+
+    def on_train_end(self, trainer, state):
+        muon = trainer.optimizers.optimizers.get("muon")
+        if muon is not None:
+            muon.probe = None
 
 
 class ConsoleLogger(Callback):

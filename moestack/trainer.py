@@ -18,7 +18,8 @@ import torch.nn as nn
 
 from . import checkpoint
 from .callbacks import (CallbackList, ConsoleLogger, ExpertAccumulation, ExpertStats,
-                        ExpertGradStats, MoELoadStats, PerExpertLR, StepState,
+                        CompassStats, ExpertGradStats, MoELoadStats, PerExpertLR,
+                        StepState,
                         WandbLogger)
 from .config import Config
 from .data import build_eval_batches, build_train_iterator
@@ -27,6 +28,7 @@ from .losses import compute_loss, lm_cross_entropy_sum
 from .model import Transformer
 from .optim import build_optimizers, lr_at
 from .parallel import ParallelDims, all_reduce_, init_distributed, parallelize
+from .stats import routing_moments
 
 
 class Trainer:
@@ -62,13 +64,17 @@ class Trainer:
         cbs = [MoELoadStats()] if cfg.logging.load_stats else []
         if cfg.optim.per_expert_lr.enabled:
             cbs.append(PerExpertLR(cfg.optim.per_expert_lr))
+        if cfg.logging.grad_stats_every:
+            # Before ExpertAccumulation, deliberately: its `on_microbatch_end` ticks
+            # the gradient window, and that tick has to land before the controller
+            # can close a window this micro-batch fed. Registered the other way
+            # round, every window undercounts its own micro-batches by one.
+            cbs.append(ExpertGradStats(cfg.logging.grad_stats_every))
         if cfg.optim.expert_accum.enabled:
             cbs.append(ExpertAccumulation(cfg.optim.expert_accum,
                                           cfg.logging.accum_events_every))
-        if cfg.logging.grad_stats_every:
-            # Before ExpertStats: it publishes the [L, E] matrices that ExpertStats
-            # then writes to the JSONL, and both read at on_before_optimizer_step.
-            cbs.append(ExpertGradStats(cfg.logging.grad_stats_every))
+        if cfg.logging.compass_stats_every:
+            cbs.append(CompassStats(cfg.logging.compass_stats_every))
         if cfg.logging.expert_stats_every:
             cbs.append(ExpertStats(cfg.logging.expert_stats_every))
         cbs += list(callbacks or [])
@@ -135,6 +141,10 @@ class Trainer:
         # Before the micro-batch loop, not after it: a callback that steps part of
         # the model mid-batch has to see this step's scheduled rate. The value does
         # not depend on anything the loop computes, so moving it changes nothing.
+        every = cfg.logging.routing_stats_every
+        routing_due = every > 0 and self.step % every == 0
+        routing = None
+
         lr = lr_at(self.step, cfg.optim, cfg.train.n_steps)
         self.optimizers.set_lr(lr)
         state = StepState(step=self.step, lr=lr)
@@ -154,6 +164,13 @@ class Trainer:
             micro_counts = torch.stack([r.counts for r in out.router_outs])
             micro_loss = loss.detach()
             counts += micro_counts
+            # Here, not in a callback: `out` is deleted below to free the
+            # activations before the all_reduce, so this is the only point at which
+            # the router distributions still exist. Same bargain as `counts`.
+            if routing_due:
+                with torch.no_grad():
+                    rm = routing_moments(out.router_outs, self.args.top_k)
+                routing = rm if routing is None else routing + rm
             del out, terms, loss, inp, tgt  # free the memory before the all_reduce
             # Fired after the activations are freed, so a callback that steps part
             # of the model here is not doing it at the peak of the micro-batch.
@@ -174,6 +191,13 @@ class Trainer:
         state.loss_terms, state.grad_norm = values, float(grad_norm)
         state.expert_counts, state.tokens_seen = counts, self.tokens_seen
         state.metrics["train/loss"] = total
+        if routing is not None:
+            # Mean over micro-batches, then over ranks: every rank carries the same
+            # token count, so a plain mean is the global-batch mean.
+            r = all_reduce_(routing / accum) / d.world_size
+            state.metrics.update({"routing/entropy": float(r[0]),
+                                  "routing/confidence": float(r[1]),
+                                  "routing/margin": float(r[2])})
         self.callbacks.on_before_optimizer_step(self, state)
 
         # Applying a non-finite step poisons the weights, and the next `save()`

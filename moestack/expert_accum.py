@@ -70,11 +70,13 @@ def resolve_threshold(threshold: int | None, threshold_rel: float | None,
     The relative form is the useful one: at tiny scale a balanced expert already
     sees ~3k tokens per micro-batch and ~49k per step, so an absolute threshold
     copied from a paper written at another scale either fires every tick or never.
-    `threshold_rel=k` asks for windows of about k ticks for an average expert.
+    `threshold_rel=k` asks for k times the tokens a balanced expert receives in one
+    optimizer *step*, on either clock -- so the same value means the same experiment
+    whether windows close per micro-batch or per step.
     """
     if threshold is not None and threshold_rel is not None:
         raise ValueError("set at most one of threshold (tokens) and threshold_rel "
-                         "(multiples of a balanced expert's per-tick load), got "
+                         "(multiples of a balanced expert's per-step load), got "
                          f"threshold={threshold}, threshold_rel={threshold_rel}")
     if threshold is None and threshold_rel is None:
         return None             # the fixed-window variant: max_window alone decides

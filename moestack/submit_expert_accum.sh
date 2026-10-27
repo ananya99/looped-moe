@@ -29,10 +29,9 @@
 #
 # Two conversions the grid depends on, both easy to get wrong:
 #
-#   Q  threshold_rel counts multiples of a balanced expert's load *per tick*, and
-#      a tick is a micro-batch on the mb cells. So the mb cells pass an ABSOLUTE
-#      threshold equal to the st cells' Q; threshold_rel=4 on both clocks would
-#      be two different experiments.
+#   Q  threshold_rel counts multiples of a balanced expert's load per *step*, on
+#      both clocks, so the same value is the same experiment either way and the
+#      paired cells share a readable budget in their names.
 #   D  max_window is in ticks too, so the mb cells' staleness cap is D_STEP times
 #      grad_accum -- otherwise "16" means 16 steps on one clock and one step on
 #      the other.
@@ -245,12 +244,6 @@ trial_note=""
 Q_STEP=$(( BATCH_SIZE * GRAD_ACCUM * SEQ_LEN * GPUS * TOP_K / N_EXPERTS ))
 D_MB=$(( D_STEP * GRAD_ACCUM ))     # the same staleness, counted in the other tick
 
-# RELS may hold fractions (1.5x a balanced load), which $(( )) cannot multiply, and
-# `threshold` is an integer token count -- so round through awk.
-q_abs () {   # q_abs <rel> -> Q_STEP x rel in whole tokens
-    awk -v q="$Q_STEP" -v r="$1" 'BEGIN { printf "%d", q * r + 0.5 }'
-}
-
 echo "Submitting batch $BATCH  ${ONLY:+only='$ONLY'  }dry=$DRY$trial_note"
 echo "  $ARCH-$SCALE $OPTIMIZER lr=$LR  ${BATCH_SIZE}x${GRAD_ACCUM}x${SEQ_LEN} x ${N_STEPS} steps" \
      "on ${GPUS}x$NODE_TYPE  ($SEQUENCES sequences/cell)"
@@ -301,14 +294,18 @@ done
 # 4. The micro-batch clock: the same budgets, but experts stop waiting for the batch
 # -------------------------------------------------------------------------------------
 #
-# Absolute Q and a converted D, so these differ from the st cells in exactly one
-# thing: when an expert may act on a full window, not how full it is.
+# The same relative Q and a converted D, so these differ from the st cells in
+# exactly one thing: when an expert may act on a full window, not how full it is.
+# `threshold_rel` counts multiples of a balanced expert's load per *step* on both
+# clocks, so the same value is the same budget here and on the st cells -- and the
+# pair reads `accmbr$r` / `accstr$r` instead of an absolute token count that means
+# nothing without also knowing the batch shape. D still needs converting, because
+# max_window is in ticks and a tick really is a micro-batch here.
 for r in $RELS; do
-    q="$(q_abs "$r")"
-    NOTES="micro-batch clock, Q=$q tokens (${r}x per-step load), D=$D_MB ticks, aux 0" \
+    NOTES="micro-batch clock, Q=${r}x per-step load, D=$D_MB ticks, aux 0" \
     run "mb-r$r" "loss.aux_coef=0" "${ACCUM[@]}" \
         "optim.expert_accum.clock=microbatch" \
-        "optim.expert_accum.threshold=$q" \
+        "optim.expert_accum.threshold_rel=$r" \
         "optim.expert_accum.max_window=$D_MB"
 done
 

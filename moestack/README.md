@@ -537,12 +537,96 @@ steps by the micro-batch count of the last one. A baseline step is still a windo
 of `grad_accum` micro-batches, which is what anchors the SNR-vs-window-tokens curve
 at the un-accumulated end.
 
-`logging.grad_stats_every=N` (default 50) controls it; the hooks are armed only on
-measured steps, so a large cadence is genuinely free on the others. The dashboard
-gets `stats.summarize` of `grad/snr` and `grad/expert_norm` (the latter over alive
-experts only, so a sea of dead cells does not drag the median), and the `[L, E]`
-matrices ride along in the `expert_stats` JSONL as `grad_snr`, `grad_grad_norm` and
-`grad_micro`.
+`logging.grad_stats_every=N` (default 50) is the **reporting** cadence only. The
+bookkeeping runs continuously, and must: window boundaries belong to
+`ExpertAccumulation`, which fires, steps and zeroes gradients on every step whether
+or not this callback is reporting. Skipping the reset on off-cadence steps leaves
+`sumsq` holding micro-batches whose gradient has been zeroed away, and the ratio is
+then between two different intervals -- which reads as SNR ~1e-5 and expert norms
+~1e-10, not as an obviously broken number.
+
+**Aggregation is two-stage, and the order matters.** At a reporting step the events
+that closed are a biased sample: hot experts fire far more often, so pooling events
+directly would weight them fifty to one -- and that weighting moves with any
+intervention that changes firing rates, which is the confound the experiment cannot
+afford. So: mean within an expert first (one vote each), then `stats.summarize` over
+experts. An expert that fired zero times in the interval reports NaN and is masked
+out; read `grad/snr` next to `accum/events_per_expert`, which says how many events
+backed each mean.
+
+The same two-stage rule applies to `update/per_token` (`rel_update / tokens`, the
+quantity that makes windows of different length commensurable) and to
+`grad/expert_norm`. One row per event goes to
+`<save_dir>/<run_name>_grad_events.jsonl`: `(step, layer, expert, tokens, micro,
+snr, grad_norm, rel_update, per_token)`. Path length -- as against the net
+displacement `ExpertStats` measures -- is the sum of `rel_update` over an expert's
+events, computed from that file.
+
+**Nothing may rescale `p.grad` between the hooks and the read.** SNR compares the
+accumulated gradient against the raw per-micro-batch norms the hooks recorded, so a
+factor applied to one side only is pure error -- and it is invisible, because the
+result is still a plausible-looking number. Two things do this, and both are
+global, so neither carries any information about within-window agreement:
+
+- `ExpertAccumulation._arm` divides the firing gradients by their token count
+  (`grad_scale="mean"`). The event is therefore opened *inside* `_close_windows`,
+  before `_arm` runs.
+- `clip_grad_norm_` shrinks the **baseline's** expert gradients by a global factor.
+  Only the baseline: once the experts are accumulators, `Trainer._clipped_params`
+  excludes them on purpose. So the baseline path divides the clip coefficient back
+  out via `open_event(grad_correction=...)`.
+
+Left in, these read as SNR ~29x and ~3.7x low respectively. The test that catches
+them is the invariant that a baseline and a `threshold=1` step clock are *the same
+measurement* -- both fire every expert every step on the same micro-batches -- so
+at step 0, where the weights and data are identical, their SNR must be identical.
+It now matches to six figures across both clocks and both `grad_scale` modes.
+
+A baseline step is itself one window of `grad_accum` micro-batches, and its event
+carries the step's counts as its token budget, so `update/per_token` is comparable
+between a baseline cell and an accumulated one. Without that it would silently be
+NaN for every baseline, and comparing the two is the point of the metric.
+
+### Alignment: `compass/*`
+
+Compass (arXiv:2610.04140) sets each expert's Muon step length from how well its
+*orthogonalised* update agrees with its current gradient. Muon normalises the
+update's singular values, so every expert matrix of a shape moves about the same
+distance per step however well-aligned it is -- and alignment degrades exactly when
+the tokens routed to an expert change while its momentum still reflects the old
+ones. That is this project's premise reached from the optimizer side.
+
+`CompassStats` computes those factors and **does not apply them**; the update stays
+plain Muon. `tests/test_compass.py` pins that two runs differing only in whether the
+callback is on produce bit-identical weights, so it is safe to switch on mid-grid.
+
+    a_e  = [cos(O_e, G_e)]_+                     expert alignment, eq. 2
+    u_e  = a_e / abar,  v_e = min(1, u_e),  c_e = v_e / vbar          family, eq. 3
+    q_er = min(1, b_er / bbar_e),  h_er = 1 + lam (q_er - 1)          rows,   eq. 4
+    alpha_e = sqrt( sum_r h_er^2 ||O_er||^2 / ||O_e||_F^2 )           radius, eq. 5
+
+with `lam = lr / peak_lr`, so the row factors relax to 1 as the schedule decays. A
+*family* is one projection matrix across a layer's experts, so `gate_up_proj` and
+`down_proj` are separate families. `compass/scale` is `c_e * alpha_e`: the radius is
+in [0, 1] by construction, while `c_e` can exceed 1 because capping `v_e` at 1 pulls
+the second mean below one -- which is why the paper's expert scale reaches 1.05-1.10
+at the top while its mean sits near 1. Zero-token experts are excluded from the
+family means, as in the paper: their gradient is exactly zero, so their "alignment"
+is not a measurement.
+
+It pairs with `grad/snr`: SNR asks whether an expert's gradient is trustworthy,
+alignment asks whether the step agrees with it, and a cold expert can fail both for
+different reasons.
+
+The measurement rides a read-only `probe` hook on `Muon`, which fires inside
+`_apply` because the orthogonalised direction exists nowhere else -- it is a local,
+consumed by the weight update. `logging.compass_stats_every` is 0 by default (it is
+a second cosine over every expert matrix) and requires `optim.name=muon`, which it
+raises about rather than silently no-op.
+
+Series are summarized over every expert *matrix*, as the paper does, laid out
+`[L, 2E]` so `argmax_layer` is a real layer and `argmax_expert` is
+`family * n_experts + expert` (family 0 = `gate_up`, 1 = `down`).
 
 ### The run summary
 

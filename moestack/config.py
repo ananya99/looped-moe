@@ -265,6 +265,14 @@ class LoggingConfig:
     # reach the JSONL, since that is the writer. The hooks are armed only on
     # measured steps, so a large cadence really is free on the others.
     grad_stats_every: int = 50
+    # Steps between `routing/*` measurements -- how decisively the router assigns,
+    # as against how evenly (`load/*`). 0 = off. One softmax over [tokens, experts]
+    # per layer on measured steps only, so a cadence really is free off-cadence.
+    routing_stats_every: int = 50
+    # Steps between Compass alignment measurements (arXiv:2610.04140), reported as
+    # compass/* and never applied to the update. Needs optim.name=muon. 0 = off;
+    # off by default because it is a second cosine over every expert matrix.
+    compass_stats_every: int = 0
 
 
 # Fields that cannot change what a run learns, and so must not change its name.
@@ -404,23 +412,41 @@ class Config:
         # "aneg0.5" rather than "a-0.5": a bare minus reads as a separator in both
         # the filename and the wandb run name (same convention as run_tracking.py).
         per_expert = ""
-        if pe.alpha != 0.0:
+        if pe.enabled:
+            # `enabled` is alpha != 0 or freeze_dead, so this also spells out "a0"
+            # for a freeze-only cell -- which is the point: that cell *is* a
+            # per-expert-LR intervention and should not read as a plain baseline.
             per_expert += f"-aneg{fmt(abs(pe.alpha))}" if pe.alpha < 0 else f"-a{fmt(pe.alpha)}"
         if pe.freeze_dead:
             per_expert += "-freeze"
         ea, accum = self.optim.expert_accum, ""
         if ea.enabled:
-            budget = ("q" + fmt(ea.threshold) if ea.threshold is not None else
-                      "r" + fmt(ea.threshold_rel) if ea.threshold_rel is not None else
+            # `r` is the readable form: multiples of a balanced expert's per-step
+            # load, which means the same thing on both clocks and across scales.
+            # `q` is only for a hand-set absolute token count, where the number is
+            # meaningless without also knowing the batch shape.
+            budget = ("r" + fmt(ea.threshold_rel) if ea.threshold_rel is not None else
+                      "q" + fmt(ea.threshold) if ea.threshold is not None else
                       "fixed")
             accum = f"-acc{'mb' if ea.clock == 'microbatch' else 'st'}{budget}"
             if ea.max_window:
                 accum += f"w{ea.max_window}"
             if ea.grad_scale != "mean":
                 accum += f"-{ea.grad_scale}"
-        return (f"{self.model.arch}-{self.model.scale}-{self.optim.name}"
-                f"-aux{fmt(self.loss.aux_coef)}-z{fmt(self.loss.z_coef)}"
-                f"-lr{fmt(self.optim.lr)}{per_expert}{accum}-{self.fingerprint()}")
+        # The readable part carries only what names an experimental *cell*: the
+        # model, the balancing regime, and the knob of whichever intervention is
+        # running -- `a<alpha>` for per-expert LR, `q<tokens>` for accumulation.
+        # The optimizer, the learning rate and the router z-coefficient are left
+        # out: they are swept across a whole grid rather than defining a cell, and
+        # they are not in `_NAME_IGNORE_FIELDS`, so they still feed the fingerprint
+        # and two runs differing only in one of them cannot collide.
+        #
+        # A non-default optimizer is the exception: an AdamW control is a different
+        # arm, not a hyper-parameter, so it stays legible. Same rule as
+        # `grad_scale` above.
+        optimizer = "" if self.optim.name == OptimConfig().name else f"-{self.optim.name}"
+        return (f"{self.model.arch}-{self.model.scale}-aux{fmt(self.loss.aux_coef)}"
+                f"{optimizer}{per_expert}{accum}-{self.fingerprint()}")
 
     def run_name(self) -> str:
         """Encodes every field that distinguishes a baseline cell, so two runs can

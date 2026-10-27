@@ -212,6 +212,7 @@ def test_hooks_fire_once_per_backward_under_activation_checkpointing():
 # ── through the trainer ──────────────────────────────────────────────
 
 import json  # noqa: E402
+import pathlib  # noqa: E402
 
 from moestack.callbacks import Callback, ExpertGradStats  # noqa: E402
 from moestack.trainer import Trainer  # noqa: E402
@@ -241,46 +242,143 @@ def _run(tmp_path, grad_every, steps=4, stats_every=0, **accum):
     return t, cap
 
 
+def _events(t, tmp_path):
+    path = pathlib.Path(tmp_path) / f"{t.run_name}_grad_events.jsonl"
+    return [json.loads(line) for line in path.open()] if path.exists() else []
+
+
 def test_snr_reaches_the_dashboard_summarized_not_per_expert(tmp_path):
     _, cap = _run(tmp_path, grad_every=1, steps=2)
-    m = cap.seen[0]
+    m = cap.seen[-1]
     assert {"grad/snr_median", "grad/snr_p10", "grad/snr_max",
-            "grad/expert_norm_median"} <= set(m)
-    # 16 x 64 would be 1,024 series; summarize caps it at seven per quantity
+            "grad/expert_norm_median", "update/rel_median",
+            "update/per_token_median"} <= set(m)
+    # 16 x 64 would be 1,024 series; summarize caps it at eight per quantity
     assert sum(k.startswith("grad/snr") for k in m) == 8
 
 
-def test_grad_stats_respect_the_cadence(tmp_path):
+def test_grad_stats_respect_the_reporting_cadence(tmp_path):
     _, cap = _run(tmp_path, grad_every=3, steps=4)
     assert ["grad/snr_median" in m for m in cap.seen] == [True, False, False, True]
 
 
 def test_nothing_is_measured_when_the_cadence_is_off(tmp_path):
     _, cap = _run(tmp_path, grad_every=0, steps=2)
-    assert not any(k.startswith("grad/") for m in cap.seen for k in m)
+    assert not any(k.startswith(("grad/", "update/")) for m in cap.seen for k in m)
 
 
-def test_the_matrices_ride_along_in_the_expert_stats_jsonl(tmp_path):
-    t, _ = _run(tmp_path, grad_every=1, steps=2, stats_every=1)
-    path = tmp_path / f"{t.run_name}_expert_stats.jsonl"
-    records = [json.loads(line) for line in path.open()]
+def test_one_jsonl_row_per_expert_update_event(tmp_path):
+    t, _ = _run(tmp_path, grad_every=1, steps=2)
+    rows = _events(t, tmp_path)
+    assert rows, "no event rows written"
+    for r in rows:
+        assert set(r) >= {"step", "layer", "expert", "tokens", "micro",
+                          "snr", "grad_norm", "rel_update", "per_token"}
+    # a baseline fires every expert once per step
     L, E = t.args.n_layers, t.args.n_experts
-    for r in records:
-        for key in ("grad_snr", "grad_grad_norm", "grad_micro"):
-            assert len(r[key]) == L and len(r[key][0]) == E, key
+    assert len([r for r in rows if r["step"] == 0]) == L * E
 
 
-def test_a_real_step_measures_a_window_of_grad_accum_microbatches(tmp_path):
-    """A baseline step *is* a window -- that is what anchors the SNR-vs-window
-    curve at the un-accumulated end."""
-    t, _ = _run(tmp_path, grad_every=1, steps=1, stats_every=1)
-    cb = next(c for c in t.callbacks.callbacks if isinstance(c, ExpertGradStats))
-    assert (cb.last["micro"] == t.cfg.data.grad_accum).all()
+def test_a_baseline_step_is_one_window_of_grad_accum_microbatches(tmp_path):
+    """That is what anchors the SNR-versus-window-tokens curve at the
+    un-accumulated end."""
+    t, _ = _run(tmp_path, grad_every=1, steps=1)
+    rows = _events(t, tmp_path)
+    assert {r["micro"] for r in rows} == {t.cfg.data.grad_accum}
+
+
+def test_a_baseline_event_carries_its_token_budget(tmp_path):
+    """Without it `update/per_token` would be NaN for every baseline cell, and the
+    metric exists precisely to compare baseline against accumulated windows."""
+    t, _ = _run(tmp_path, grad_every=1, steps=1)
+    rows = _events(t, tmp_path)
+    assert any(r["tokens"] and r["tokens"] > 0 for r in rows)
+    assert any(r["per_token"] == r["per_token"] for r in rows)      # not NaN
+
+
+def test_displacement_is_non_zero_under_every_clock(tmp_path):
+    """The bug this replaced: under clock=microbatch the experts move inside the
+    micro-batch loop, so a step-level before/after bracketed an interval in which
+    nothing happened and reported exactly 0."""
+    for clock in (None, "microbatch", "step"):
+        kw = {} if clock is None else dict(enabled=True, clock=clock,
+                                           threshold=1, max_window=1)
+        _, cap = _run(tmp_path / f"c{clock}", grad_every=1, steps=3, **kw)
+        rel = cap.seen[-1]["update/rel_median"]
+        assert rel > 0, f"clock={clock} reported zero displacement"
 
 
 def test_accumulation_takes_over_the_clock(tmp_path):
-    """With expert-local accumulation the controller owns window boundaries, so the
-    step boundary must not blanket-reset them."""
-    t, _ = _run(tmp_path, grad_every=1, steps=2, enabled=True, threshold=1, max_window=1)
+    t, _ = _run(tmp_path, grad_every=1, steps=2, enabled=True,
+                clock="microbatch", threshold=1, max_window=1)
     cb = next(c for c in t.callbacks.callbacks if isinstance(c, ExpertGradStats))
-    assert cb._external_clock
+    assert cb._external
+
+
+def test_the_grad_window_is_ticked_before_the_controller_closes_it(tmp_path):
+    """ExpertGradStats is registered before ExpertAccumulation so its tick lands
+    first. Registered the other way round, every window undercounts its own
+    micro-batches by one."""
+    t, _ = _run(tmp_path, grad_every=1, steps=1, enabled=True,
+                clock="microbatch", threshold=1, max_window=1)
+    order = [type(c).__name__ for c in t.callbacks.callbacks]
+    assert order.index("ExpertGradStats") < order.index("ExpertAccumulation")
+    assert all(r["micro"] >= 1 for r in _events(t, tmp_path))
+
+
+# ── SNR must not depend on anything that rescales the gradient ───────
+
+def _step0_snr(tmp_path, **accum):
+    """Median SNR of the events at step 0, where every configuration starts from
+    identical weights and sees identical data -- so the gradients are the same and
+    any difference in SNR is a measurement artefact, not training."""
+    import statistics
+    t, _ = _run(tmp_path, grad_every=1, steps=1, **accum)
+    vals = [r["snr"] for r in _events(t, tmp_path)
+            if r["step"] == 0 and r["snr"] == r["snr"]]
+    return statistics.median(sorted(vals))
+
+
+def test_snr_is_the_same_under_every_clock_at_step_zero(tmp_path):
+    """A baseline and a Q=1 step clock fire every expert every step on the same
+    micro-batches, so they are the same measurement and must agree.
+
+    They did not. Two separate things rescaled `p.grad` after the hooks had already
+    recorded the raw per-micro-batch norms, scaling one side of the ratio only:
+    `ExpertAccumulation._arm` divides the firing gradients by their token count,
+    and `clip_grad_norm_` shrinks the baseline's expert gradients by a global
+    factor (under accumulation the experts are accumulators and are excluded from
+    clipping). SNR came out ~29x low in the first case and ~3.7x low in the second.
+    """
+    base = _step0_snr(tmp_path / "base")
+    q1 = _step0_snr(tmp_path / "q1", enabled=True, clock="step",
+                    threshold=1, max_window=99)
+    assert q1 == pytest.approx(base, rel=1e-6)
+
+
+def test_snr_does_not_depend_on_the_grad_scale_mode(tmp_path):
+    """`grad_scale` changes the gradient handed to the optimizer, never the
+    agreement among the micro-gradients that built it."""
+    mean = _step0_snr(tmp_path / "mean", enabled=True, clock="step",
+                      threshold=1, max_window=99, grad_scale="mean")
+    total = _step0_snr(tmp_path / "sum", enabled=True, clock="step",
+                       threshold=1, max_window=99, grad_scale="sum")
+    assert mean == pytest.approx(total, rel=1e-9)
+
+
+def test_snr_does_not_depend_on_the_clipping_threshold(tmp_path):
+    """Clipping is one global scalar over the whole model, so it says nothing about
+    any single expert's within-window agreement and must divide out."""
+    def with_clip(c, d):
+        cfg = tiny_config(d)
+        cfg.train.n_steps, cfg.logging.grad_stats_every = 1, 1
+        cfg.optim.grad_clip = c
+        cfg.__post_init__()
+        t = Trainer(cfg, verbose=False)
+        t.fit()
+        import statistics
+        vals = [r["snr"] for r in _events(t, d) if r["snr"] == r["snr"]]
+        return statistics.median(sorted(vals))
+
+    assert with_clip(1.0, tmp_path / "a") == pytest.approx(
+        with_clip(0.01, tmp_path / "b"), rel=1e-5)

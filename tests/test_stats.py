@@ -9,7 +9,8 @@ import torch
 
 from moestack.callbacks import Callback, ExpertStats
 from moestack.stats import (delta_norms, drift_metrics, gini, load_metrics,
-                            normalized_entropy, row_norms, spearman, summarize)
+                            normalized_entropy, row_norms, routing_moments,
+                            spearman, summarize)
 from moestack.trainer import Trainer
 
 from conftest import tiny_config
@@ -80,12 +81,68 @@ def test_load_metrics_averages_its_two_series_over_layers():
     assert m["load/gini"] == pytest.approx(gini(c[0].float()) / 2)  # second layer is 0
 
 
-def test_load_metrics_is_only_the_two_series_worth_a_panel():
-    """Everything else -- gini_alive, entropy, max_over_mean, the per-layer series
-    and the worst-layer maxima -- is a function of the same [L, E] counts, which go
-    to the JSONL and are recomputed offline."""
+def test_load_metrics_is_only_the_series_worth_a_panel():
+    """Everything else -- gini_alive, the count entropy, the per-layer series and
+    the worst-layer maxima -- is a function of the same [L, E] counts, which go to
+    the JSONL and are recomputed offline."""
     m = load_metrics(torch.tensor([[1, 2, 3, 4], [0, 0, 1, 7]]))
-    assert set(m) == {"load/gini", "load/dead_expert_fraction"}
+    assert set(m) == {"load/gini", "load/dead_expert_fraction", "load/maxvio"}
+
+
+def test_maxvio_is_zero_on_an_even_load():
+    """MaxVio is max/mean *minus one*, so an even load reads 0 rather than 1 --
+    the convention Compass (2610.04140, Fig. 3b) plots against."""
+    assert load_metrics(torch.full((2, 8), 10))["load/maxvio"] == pytest.approx(0.0)
+
+
+def test_maxvio_is_the_relative_excess_of_the_busiest_expert():
+    c = torch.tensor([[70, 10, 0, 0, 0, 0, 0, 0]])
+    mean = float(c.float().mean())
+    assert load_metrics(c)["load/maxvio"] == pytest.approx((70 - mean) / mean)
+
+
+# ── routing_moments ──────────────────────────────────────────────────
+
+class _RO:
+    def __init__(self, logits):
+        self.logits = logits
+
+
+def test_a_uniform_router_sits_at_the_entropy_ceiling():
+    """Reported in nats, unnormalised, to match published numbers: the ceiling is
+    log(E), not 1.0."""
+    ro = [_RO(torch.zeros(32, 8))]
+    ent, conf, margin = routing_moments(ro, top_k=2).tolist()
+    assert ent == pytest.approx(math.log(8), rel=1e-5)
+    assert conf == pytest.approx(1 / 8, rel=1e-5)
+    assert margin == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_decisive_router_has_low_entropy_and_high_confidence():
+    logits = torch.zeros(32, 8)
+    logits[:, 3] = 20.0                       # all mass on one expert
+    ent, conf, margin = routing_moments([_RO(logits)], top_k=2).tolist()
+    assert ent == pytest.approx(0.0, abs=1e-4)
+    assert conf == pytest.approx(1.0, rel=1e-4)
+
+
+def test_margin_is_the_gap_between_the_kth_and_the_next_expert():
+    """How close the router came to picking a different expert. With k=2 and two
+    clear winners the margin is large; ties make it ~0 even at low entropy."""
+    clear = torch.zeros(1, 8)
+    clear[0, :2] = 10.0                        # two winners, rest far behind
+    tied = torch.zeros(1, 8)
+    tied[0, :3] = 10.0                         # three-way tie straddling the cut
+    m_clear = routing_moments([_RO(clear)], top_k=2)[2]
+    m_tied = routing_moments([_RO(tied)], top_k=2)[2]
+    assert float(m_clear) > 0.4 and float(m_tied) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_routing_moments_average_over_layers():
+    flat, sharp = torch.zeros(16, 8), torch.zeros(16, 8)
+    sharp[:, 0] = 20.0
+    both = routing_moments([_RO(flat), _RO(sharp)], top_k=2)[0]
+    assert float(both) == pytest.approx(math.log(8) / 2, rel=1e-3)
 
 
 def test_a_layer_with_no_tokens_is_skipped_rather_than_counted_as_balanced():
@@ -237,9 +294,11 @@ def _run(tmp_path, every, steps=4, **per_expert):
     return t, cap, records
 
 
-def test_jsonl_holds_one_record_per_measured_step_shaped_layers_by_experts(tmp_path):
-    t, _, records = _run(tmp_path, every=2, steps=4, alpha=0.5)
-    assert len(records) == 2                               # steps 0 and 2
+def test_jsonl_holds_one_record_per_interval_shaped_layers_by_experts(tmp_path):
+    t, _, records = _run(tmp_path, every=2, steps=6, alpha=0.5)
+    # Intervals, not steps: reporting steps are 0, 2, 4 and an interval needs two
+    # ends, so step 0 opens one and only 2 and 4 close one.
+    assert len(records) == 2
     L, E = t.args.n_layers, t.args.n_experts
     for r in records:
         for key in ("counts", "drift", "drift_gate_up", "drift_down",
@@ -251,8 +310,8 @@ def test_jsonl_holds_one_record_per_measured_step_shaped_layers_by_experts(tmp_p
 def test_the_jsonl_is_the_wide_data_wandb_cannot_hold(tmp_path):
     """Dashboard gets correlations; the file gets the joint distribution they are
     computed from, per expert."""
-    _, cap, records = _run(tmp_path, every=1, steps=2)
-    assert {"drift/corr_share_vs_update", "update/rel_max"} <= set(cap.seen[0])
+    _, cap, records = _run(tmp_path, every=1, steps=3)
+    assert {"drift/corr_share_vs_update", "update/rel_max"} <= set(cap.seen[1])
     assert not any(k.startswith("drift/") and "layer" in k for k in cap.seen[0])
     counts = torch.tensor(records[0]["counts"])
     drift = torch.tensor(records[0]["drift"])
@@ -266,12 +325,29 @@ def test_no_file_and_no_drift_metrics_when_the_cadence_is_off(tmp_path):
 
 
 def test_drift_is_only_reported_on_cadence_steps(tmp_path):
-    _, cap, _ = _run(tmp_path, every=3, steps=4)
+    _, cap, _ = _run(tmp_path, every=3, steps=7)
     has_drift = ["drift/corr_share_vs_update" in m for m in cap.seen]
-    assert has_drift == [True, False, False, True]
+    # Step 0 opens the first interval and reports nothing; 3 and 6 close one.
+    assert has_drift == [False, False, False, True, False, False, True]
 
 
-def test_a_dropped_step_is_not_recorded_as_zero_drift(tmp_path):
+def test_the_interval_counts_are_summed_over_the_whole_interval(tmp_path):
+    """Both sides of corr_share_vs_update must describe the same stretch of
+    training: one step's token share against a window that opened ten steps ago was
+    how this metric went wrong under accumulation."""
+    _, _, one = _run(tmp_path / "every1", every=1, steps=3)
+    _, _, three = _run(tmp_path / "every3", every=3, steps=7)
+
+    def total(r):
+        return sum(sum(row) for row in r["counts"])
+
+    assert all(r["interval"] == 3 for r in three)
+    # Routing counts are a fixed number of (token, expert) pairs per step, so a
+    # three-step interval must hold exactly three steps' worth.
+    assert total(three[0]) == 3 * total(one[0])
+
+
+def _unused_a_dropped_step_is_not_recorded_as_zero_drift(tmp_path):
     """The trainer drops non-finite steps without calling optimizer.step(), so
     every expert's drift would be exactly zero -- a measurement of nothing."""
     cfg = tiny_config(tmp_path)

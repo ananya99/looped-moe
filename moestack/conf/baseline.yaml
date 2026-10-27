@@ -98,6 +98,11 @@ logging:
   # Per-expert gradient SNR every N steps (0 = off). Hooks are armed only on
   # measured steps. Rides the expert_stats JSONL, so keep the two cadences equal.
   grad_stats_every: 50
+  # routing/{entropy,confidence,margin}: how decisively the router assigns, as
+  # against how evenly (load/*). Entropy is in nats; the ceiling is log(n_experts).
+  routing_stats_every: 50
+  # Compass alignment factors (arXiv:2610.04140), measured not applied. Muon only.
+  compass_stats_every: 0
 
 hydra:
   job:

@@ -20,7 +20,7 @@ it (as the original trainer did); synthetic resumes by skipping instantly.
 from __future__ import annotations
 
 import json
-import math
+import warnings
 from pathlib import Path
 from typing import Iterator
 
@@ -30,8 +30,9 @@ import torch
 from .config import DataConfig
 
 # `data.get_eval_batches` reaches its batches by skipping this many tokens into the
-# stream. The disk source reproduces that offset exactly rather than inventing its
-# own eval set, so disk and stream runs are directly comparable.
+# stream. The disk source used to reproduce that offset exactly, so that disk and
+# stream runs evaluated on the same text -- see `DiskSource.eval_batches` for why
+# it no longer does. Kept because the stream path still goes through upstream.
 EVAL_SKIP_TOKENS = 10_000_000
 
 
@@ -110,17 +111,35 @@ class DiskSource:
             yield self.batch(i)
             i += 1
 
-    def eval_batches(self, n_batches: int) -> list:
-        """The same slice of the stream `data.get_eval_batches` would return: it
-        counts seq_len per sequence and keeps the first whose running total reaches
-        EVAL_SKIP_TOKENS, i.e. sequence index ceil(skip / seq_len) - 1."""
-        first = math.ceil(EVAL_SKIP_TOKENS / self.cfg.seq_len) - 1
+    def eval_batches(self, n_batches: int, train_sequences: int = 0) -> list:
+        """The **tail** of the cache: the sequences a run never reaches.
+
+        This used to be the slice `data.get_eval_batches` returns -- `EVAL_SKIP_TOKENS`
+        into the stream -- so that disk and stream runs scored the same text. That
+        offset is sequence 4,882 at seq_len=2048, and training reads 256 sequences a
+        step at 16x16, so **training overran the entire eval set by step 20** and
+        every `eval/loss` after it was measuring memorisation. A 10M-token skip is a
+        20-step head start, not a holdout.
+
+        The tail is held out by construction for any run that does not wrap the
+        cache, and `train_sequences` makes that condition explicit rather than
+        assumed: pass the number of sequences the whole run will read and this
+        refuses to hand back a slice the run would train on. The training stream is
+        untouched -- only the eval set moves -- so `train/lm_loss` still lines up
+        with runs logged before the change, while their `eval/loss` does not.
+        """
         need = n_batches * self.cfg.batch_size
-        if first + need > self.n_seq:
+        if need > self.n_seq:
             raise ValueError(
-                f"cache holds {self.n_seq:,} sequences, but the eval slice needs "
-                f"{first + need:,} (it starts {EVAL_SKIP_TOKENS:,} tokens in). "
-                f"Rebuild with more --tokens.")
+                f"cache holds {self.n_seq:,} sequences, fewer than the {need:,} the "
+                f"eval slice needs. Rebuild with more --tokens.")
+        first = self.n_seq - need
+        if train_sequences > first:
+            raise ValueError(
+                f"the run reads {train_sequences:,} sequences but the held-out tail "
+                f"starts at {first:,}, so it would train on its own eval set. Shorten "
+                f"the run, lower data.eval_batches, or rebuild the cache with more "
+                f"--tokens.")
         inp, tgt = self._sequences(first, need)
         return list(zip(inp.split(self.cfg.batch_size), tgt.split(self.cfg.batch_size)))
 
@@ -171,14 +190,28 @@ def build_train_iterator(cfg: DataConfig, vocab_size: int, seed: int, rank: int,
     raise ValueError(f"unknown data source {cfg.source!r}")
 
 
-def build_eval_batches(cfg: DataConfig, vocab_size: int, seed: int) -> list:
+def build_eval_batches(cfg: DataConfig, vocab_size: int, seed: int,
+                       train_sequences: int = 0) -> list:
+    """`train_sequences` is how many sequences the whole run reads; the disk source
+    uses it to prove its slice is one the run never trains on."""
     if cfg.source == "disk":
         # rank 0 / world 1: every rank evaluates on the identical slice.
-        return DiskSource(cfg.cache_dir, cfg).eval_batches(cfg.eval_batches)
+        return DiskSource(cfg.cache_dir, cfg).eval_batches(cfg.eval_batches,
+                                                           train_sequences)
     if cfg.source == "synthetic":
         # Rank -1 keeps eval disjoint from every training stream and identical on all ranks.
         src = SyntheticSource(vocab_size, cfg, seed, rank=-1)
         return [src.batch(i) for i in range(cfg.eval_batches)]
+    # Upstream skips EVAL_SKIP_TOKENS into the same stream training reads from, and
+    # there is no tail to retreat to, so this slice is held out only for a run short
+    # enough never to reach it. Warned, not raised: the stream path predates this and
+    # is not what the configs use.
+    if train_sequences * cfg.seq_len > EVAL_SKIP_TOKENS:
+        warnings.warn(
+            f"data.source=stream evaluates {EVAL_SKIP_TOKENS:,} tokens into the "
+            f"training stream, which this run of ~{train_sequences * cfg.seq_len:,} "
+            f"tokens reads past: eval/loss will score text the model has trained on. "
+            f"Use data.source=disk for a held-out tail.", RuntimeWarning, stacklevel=2)
     from data import get_eval_batches
     return get_eval_batches(seq_len=cfg.seq_len, batch_size=cfg.batch_size,
                             n_batches=cfg.eval_batches, tokenizer=cfg.tokenizer,

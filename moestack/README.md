@@ -63,9 +63,22 @@ plan longer runs. Keep `--num-workers` low: each worker holds its own two
 10,000-document shuffle buffers in RAM, and 8 of them got the build OOM-killed.
 
 Tokens come from the repo-root loader unmodified, so a `disk` run sees the same
-sequences in the same order as a `stream` run, and the eval slice reproduces
-`get_eval_batches`' 10 M-token offset exactly. `disk` is also seekable, so resume
+sequences in the same order as a `stream` run. `disk` is also seekable, so resume
 seeks instead of replaying the stream.
+
+**The eval slice is the tail of the cache**, not `get_eval_batches`' 10 M-token
+offset. That offset is sequence 4,882 at `seq_len=2048`, and a 16x16 run reads 256
+sequences a step, so training overran the whole eval set at **step 19** and every
+`eval/loss` logged before this change scored memorised text. The tail is held out
+for any run that does not wrap the cache, and the condition is checked rather than
+assumed: `Trainer` passes the sequences the run will read and `DiskSource.eval_batches`
+refuses a slice the run would train on. At 1.16 B tokens with `data.eval_batches=40`
+the holdout is sequences 565,489-566,128 and the ceiling is **2,208 steps** at
+16x16 on one GPU; ask for more and the run fails at its first eval with the number
+to rebuild to. `source=stream` has no tail to retreat to and still reads upstream's
+offset, so it warns instead. Train curves are unaffected -- only the eval set moved
+-- so `train/lm_loss` still lines up with earlier runs while their `eval/loss` does
+not.
 
 ```bash
 python -m moestack.train                                      # conf/baseline.yaml
@@ -484,10 +497,10 @@ not merely unplotted.
 The dashboard gets `drift/corr_share_vs_update` (Spearman, ties averaged, NaN rather
 than 0 when there is no rank variance), `drift/dead_over_alive` — the
 zero-token-expert effect in one number, which `freeze_dead` should drive to 0 — and
-`update/rel_*`. Dropped (non-finite) steps are not recorded: no optimizer step ran,
+`drift/rel_*`. Dropped (non-finite) steps are not recorded: no optimizer step ran,
 so the drift would be zero by construction.
 
-`update/rel` is `||Δw_e|| / ||w_e||`: the quantity Muon actually controls, and the
+`drift/rel` is `||Δw_e|| / ||w_e||`: the quantity Muon actually controls, and the
 only one comparable between layers of different width and across training as the
 weights grow. It replaces the raw `drift/{mean,max,dead_mean}`. It is reported
 through `stats.summarize`, the shared helper for any `[L, E]` quantity, which gives
@@ -501,6 +514,17 @@ absolute deviation, falling back to the mean deviation when the MAD is zero — 
 is the normal case, since Newton-Schulz drives many update norms to near-identical
 values, and a MAD of zero would otherwise switch the alarm off exactly where a lone
 outlier is most visible.
+
+**`drift/rel` and `update/rel` are two different measurements.** Both are
+`||Δw||/||w||`. `drift/rel` is net displacement over the whole reporting interval,
+on the step clock, from `ExpertStats`; `update/rel` is the displacement of a single
+*event*, on the event clock, from `ExpertGradStats`, and it is the numerator of
+`update/per_token`. The namespace carries the clock: `drift/*` is the interval,
+`update/*` is the event. They were both called `update/rel` until the split, with
+`ExpertStats` registered last and so winning every reporting step but the first —
+read a run logged before the split as `drift/rel_*` wearing the other name, and
+expect a discontinuity at its first reporting step, where the per-event value got
+through. `CallbackList._fire` now raises if two callbacks write one key in a step.
 
 ### Gradient quality: `grad/snr`
 
@@ -643,8 +667,24 @@ clamping — applied after normalisation — has pushed the alive mean off 1.0, 
 alpha sweep is no longer comparing equal-average cells. You need them to defend a
 result; you do not need to watch them arrive.
 
-`eval/` is `loss` alone. `perplexity` was `exp(loss)`: the same curve on a different
-axis.
+`eval/` is `loss`, `load/{gini,dead_expert_fraction,maxvio}` and
+`routing/{entropy,confidence,margin}` — the same two families as the training-side
+`load/*` and `routing/*`, measured on the holdout. The router produces both during
+the eval forward anyway, so they cost a softmax per layer and nothing else, and the
+holdout is the one slice every cell and every eval step scores *in common*: a cell
+whose `load/gini` differs from another's on the training batch has partly been
+handed different routing problems, while on the holdout it has not. Counts are
+summed over the whole eval set and the moments averaged over its batches, and
+nothing is reduced — every rank scores the identical slice, so each already holds
+the global number.
+
+Two things they are not. They are not comparable with the training-side series at
+the same step: `data.eval_batches=40` is 1.31 M tokens against a step's 524 k, and
+both `gini` and `dead_expert_fraction` fall as the token budget rises. And
+`dead_expert_fraction` here means "saw no holdout token", which is a statement
+about 1.31 M tokens, not about the expert being dead in any permanent sense.
+
+`perplexity` was `exp(loss)`: the same curve on a different axis.
 
 Both cadences live in `logging`, so they never change a run's name or fingerprint.
 
@@ -657,33 +697,15 @@ Both cadences live in `logging`, so they never change a run's name or fingerprin
 - **Expert parallelism**: an `AllToAllDispatcher` implementing `dispatch`/`combine`,
   `GroupedExperts(n_local_experts=E/ep)`, and expert grads reduced over `edp` only.
   Test: EP=2 matches EP=1 on loss and grads.
-- **Hold out the eval slice** (deferred, not a blocker). `DiskSource.batch` walks
-  sequences from 0 with no exclusion, while `eval_batches` reads 160 sequences from
-  index `ceil(10M/seq_len) - 1` of the same cache: at `seq_len=2048`,
-  `batch_size=16`, `grad_accum=16` that is sequences 4882-5041, which training
-  consumes at **step 19**. The 10M offset was never a holdout, and the streaming
-  `data.get_eval_batches` has the same overlap -- so "disk and stream are
-  comparable" means comparably contaminated, and fixing either side breaks that
-  comparison anyway.
+- **Hole-punched holdout** (optional; the eval slice is already held out). The slice
+  is now the cache tail, and `DiskSource.eval_batches` raises when a run is long
+  enough to reach it -- which answers the objection to the tail, that it fails
+  silently on a wrap, by making it fail loudly. What it still costs is the last
+  ~2,200 steps' worth of headroom: a longer run has to rebuild the cache rather
+  than just run. The alternative is to reserve a hole that `DiskSource.batch` maps
+  around, which survives a wrap and costs a branch in the hot index path. Worth
+  doing only when runs actually need to go past the cache.
 
-  Deliberately deferred, because the contamination is **common-mode**: `DiskSource`
-  order is index-based (`seed` only touches `SyntheticSource`), so every cell and
-  every seed meets the eval block at the same point, and a bias shared by all cells
-  cancels out of the cell-vs-cell comparisons the experiments actually make. 160
-  sequences out of 512,000, seen once at step 19 and followed by ~1,980 steps of
-  other data, is small on its own terms too.
-
-  It stops being common-mode if a run **wraps the cache**: 2000 steps x 16 x 16 on
-  one GPU is 512,000 of 566,129 sequences, about 211 steps of headroom, and past
-  that training sees the eval slice a second time -- ordinary multi-epoch
-  memorisation, which `submit_expert_accum.sh` only warns about rather than
-  prevents. Do this before extending runs past ~2,200 steps, or before reporting
-  absolute held-out numbers.
-
-  Preferred fix: reserve a hole at the existing offset so `DiskSource.batch` maps
-  around it, behind a `data.eval_holdout` flag so existing configs reproduce. That
-  survives a cache wrap; moving the holdout to the end of the cache does not, and
-  fails silently when it does.
 - **Experiments** (tying, routing rules): new `Rule`s, group attributes, or a
   callback/step policy — not edits to `trainer.py`. Per-expert LR and expert-local
   accumulation, above, are the two worked examples: a group attribute, a pure rule

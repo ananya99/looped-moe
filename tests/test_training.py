@@ -2,6 +2,7 @@
 activation-checkpointing / compile transforms (CPU, synthetic data)."""
 
 import copy
+import math
 
 import pytest
 import torch
@@ -99,6 +100,33 @@ def test_trainer_runs_and_loss_decreases(tmp_path):
     assert res["tokens_seen"] == 30 * t.tokens_per_step
 
 
+def test_eval_reports_routing_and_load_not_just_loss(tmp_path):
+    """The holdout is the one slice every cell and every eval step scores in common,
+    so routing measured on it is comparable in a way `load/*` on the training batch
+    is not. The router produced these during the eval forward either way."""
+    cfg = tiny_config(tmp_path, train=dict(n_steps=1))
+    cfg.data.eval_batches = 3
+    cfg.__post_init__()
+    t = Trainer(cfg, verbose=False)
+    m = t.evaluate()
+    assert set(m) == {"loss", "load/gini", "load/dead_expert_fraction", "load/maxvio",
+                      "routing/entropy", "routing/confidence", "routing/margin"}
+    assert 0.0 <= m["load/gini"] <= 1.0
+    # entropy is in nats and unnormalised, so the ceiling is log(n_experts)
+    assert 0.0 < m["routing/entropy"] <= math.log(t.args.n_experts)
+
+
+def test_eval_metrics_do_not_carry_over_between_calls(tmp_path):
+    """The counts are summed across the eval batches and must restart each call. An
+    accumulator that survived would pool every eval ever run, so gini would drift
+    down over training for no reason but the bug."""
+    cfg = tiny_config(tmp_path, train=dict(n_steps=1))
+    cfg.data.eval_batches = 3
+    cfg.__post_init__()
+    t = Trainer(cfg, verbose=False)
+    assert t.evaluate() == t.evaluate()
+
+
 def test_resume_reproduces_uninterrupted_run(tmp_path):
     a_dir, b_dir = tmp_path / "a", tmp_path / "b"
     straight = Trainer(tiny_config(a_dir, train=dict(n_steps=6)), verbose=False)
@@ -140,3 +168,28 @@ def test_compile_matches_eager():
     fwd2 = parallelize(m2, ParallelConfig(compile=True), CPU)
     x = torch.randint(0, 256, (2, 16))
     torch.testing.assert_close(m1(x).logits, fwd2(x).logits, atol=1e-4, rtol=1e-4)
+
+
+def test_two_callbacks_cannot_publish_one_metric_key():
+    """A metric written twice in a step is always a defect: the later writer wins
+    silently and the series alternates between two quantities. `update/rel` was
+    exactly that for an interval and a per-event measurement, and it read as a jump
+    in the data rather than a bug, so CallbackList fails on the first collision."""
+    from moestack.callbacks import Callback, CallbackList, StepState
+
+    class _Writer(Callback):
+        def __init__(self, value):
+            self.value = value
+
+        def on_step_end(self, trainer, state):
+            state.metrics["update/rel_median"] = self.value
+
+    cbs = CallbackList([_Writer(0.1), _Writer(0.2)])
+    state = StepState(step=50)
+    with pytest.raises(RuntimeError, match=r"update/rel_median"):
+        cbs.on_step_end(None, state)
+
+    # One writer is fine, and an untouched key is not a collision.
+    state = StepState(step=50)
+    CallbackList([_Writer(0.1), Callback()]).on_step_end(None, state)
+    assert state.metrics == {"update/rel_median": 0.1}

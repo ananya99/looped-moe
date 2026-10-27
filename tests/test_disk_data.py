@@ -110,38 +110,46 @@ def test_seeking_equals_consuming(tmp_path):
 
 # ── eval slice ───────────────────────────────────────────────────────
 
-def test_eval_offset_matches_upstream_get_eval_batches():
-    """Replicate data.get_eval_batches' skip loop and check DiskSource lands on the
-    same first sequence. It counts seq_len (not seq_len+1) per sequence."""
-    for seq_len in (512, 1024, 2048):
-        skipped = 0
-        count = 0
-        while True:
-            count += seq_len
-            if count < EVAL_SKIP_TOKENS:
-                skipped += 1
-            else:
-                break
-        assert math.ceil(EVAL_SKIP_TOKENS / seq_len) - 1 == skipped, seq_len
-    assert math.ceil(EVAL_SKIP_TOKENS / 2048) - 1 == 4882
+def test_the_upstream_offset_is_a_head_start_not_a_holdout():
+    """Why the eval slice moved. `data.get_eval_batches` skips EVAL_SKIP_TOKENS into
+    the same stream training reads from, which at seq_len=2048 is sequence 4,882 --
+    and a 16x16 run reads 256 sequences a step, so it trains on the start of the
+    eval set at step 19. Every eval/loss logged before this change scored memorised
+    text."""
+    first = math.ceil(EVAL_SKIP_TOKENS / 2048) - 1
+    assert first == 4882
+    per_step = 16 * 16                      # batch_size x grad_accum, world 1
+    assert first // per_step == 19
 
 
-def test_eval_batches_come_from_the_offset(tmp_path, monkeypatch):
-    T, B = 8, 2
-    monkeypatch.setattr("moestack.data.EVAL_SKIP_TOKENS", 80)   # -> first = 9
-    cache = make_cache(tmp_path, n_tokens=(T + 1) * 40, seq_len=T, vocab=10_000)
+def test_eval_batches_come_from_the_tail(tmp_path):
+    T, B, n_seq = 8, 2, 40
+    cache = make_cache(tmp_path, n_tokens=(T + 1) * n_seq, seq_len=T, vocab=10_000)
     src = DiskSource(str(cache), cfg_for(cache, T, B))
     batches = src.eval_batches(2)
     assert len(batches) == 2 and all(x.shape == (B, T) for x, _ in batches)
-    first = math.ceil(80 / T) - 1
+    first = n_seq - 2 * B                   # the last four sequences
     assert int(batches[0][0][0, 0]) == first * (T + 1)
+    # and the last row read is the last sequence in the cache
+    assert int(batches[-1][0][-1, 0]) == (n_seq - 1) * (T + 1)
+
+
+def test_eval_refuses_a_slice_the_run_would_train_on(tmp_path):
+    """The holdout is the tail, so it is held out only for a run that does not reach
+    it. That condition is checked, not assumed."""
+    T, B, n_seq = 8, 2, 40
+    cache = make_cache(tmp_path, n_tokens=(T + 1) * n_seq, seq_len=T, vocab=10_000)
+    src = DiskSource(str(cache), cfg_for(cache, T, B))
+    src.eval_batches(2, train_sequences=36)                  # exactly up to the tail
+    with pytest.raises(ValueError, match="train on its own eval set"):
+        src.eval_batches(2, train_sequences=37)
 
 
 def test_eval_raises_when_the_cache_is_too_short(tmp_path):
     cache = make_cache(tmp_path, n_tokens=(8 + 1) * 20, seq_len=8, vocab=10_000)
     src = DiskSource(str(cache), cfg_for(cache, 8, 2))
     with pytest.raises(ValueError, match="Rebuild with more"):
-        src.eval_batches(2)
+        src.eval_batches(20)
 
 
 # ── guards ───────────────────────────────────────────────────────────
@@ -161,10 +169,10 @@ def test_config_requires_cache_dir():
 
 # ── end to end ───────────────────────────────────────────────────────
 
-def test_trainer_trains_from_disk(tmp_path, monkeypatch):
+def test_trainer_trains_from_disk(tmp_path):
     T, B, accum, steps = 32, 4, 2, 6
-    # fit() always evaluates at the end; shrink the eval offset to fit a test cache
-    monkeypatch.setattr("moestack.data.EVAL_SKIP_TOKENS", 64)
+    # fit() always evaluates at the end, and the eval slice is the cache tail, so
+    # the cache has to hold the run's 48 sequences plus the holdout.
     cache = make_cache(tmp_path, n_tokens=(T + 1) * (B * accum * steps + 16),
                        seq_len=T, vocab=TINY["vocab_size"])
     cfg = tiny_config(tmp_path, train=dict(n_steps=steps, eval_every=0, save_every=0))

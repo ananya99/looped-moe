@@ -71,9 +71,32 @@ class CallbackList(Callback):
     def __init__(self, callbacks: list[Callback]):
         self.callbacks = callbacks
 
+    # The events on which callbacks write `state.metrics`. `on_microbatch_end`
+    # writes none and fires `grad_accum` times a step, so it is left unguarded.
+    _GUARDED = frozenset({"on_before_optimizer_step", "on_accepted_step", "on_step_end"})
+
     def _fire(self, name, *args):
+        # Two writers of one metric key in a step is always a bug: the later one
+        # wins silently and the series alternates between two different
+        # quantities, which looks like a jump in the data rather than a defect.
+        # `update/rel` was exactly this -- an interval measurement from
+        # `ExpertStats` and a per-event one from `ExpertGradStats` under one name,
+        # with the collision visible only as a step-50 discontinuity. Caught here,
+        # on the first reporting step, rather than in the analysis months later.
+        guard = name in self._GUARDED
+        state = args[1] if guard else None
         for cb in self.callbacks:
+            before = dict(state.metrics) if guard else None
             getattr(cb, name)(*args)
+            if not guard:
+                continue
+            clash = sorted(k for k, v in before.items()
+                           if k in state.metrics and state.metrics[k] is not v)
+            if clash:
+                raise RuntimeError(
+                    f"{type(cb).__name__}.{name} overwrote {clash}, already written "
+                    f"earlier in step {state.step}. Two publishers are sharing a "
+                    f"metric key; give one of them its own name.")
 
     def on_train_start(self, t): self._fire("on_train_start", t)
     def on_microbatch_end(self, t, s, i, c, l): self._fire("on_microbatch_end", t, s, i, c, l)
@@ -572,6 +595,10 @@ class ExpertStats(Callback):
     and the wrong one for "how much did it move" -- path length is the sum of
     `rel_update` over the expert's events, in the grad-events JSONL.
 
+    Published as `drift/rel_*`. `ExpertGradStats` publishes the per-event version as
+    `update/rel_*`; both are ||dw||/||w|| and they are not interchangeable, so the
+    namespace carries the clock.
+
     Snapshots go to host memory, which is why this runs on a cadence at all.
     """
 
@@ -680,7 +707,11 @@ class ExpertGradStats(Callback):
     anchors the SNR-versus-window-tokens curve at the un-accumulated end.
     """
 
-    # field in the event record -> metric namespace it is published under
+    # field in the event record -> metric namespace it is published under.
+    # `update/*` is the **event** clock throughout: `update/rel` is one event's
+    # displacement and `update/per_token` is that divided by the tokens that built
+    # it. The interval counterpart on the step clock is `drift/rel`, from
+    # `ExpertStats` -- a different measurement, which is why it has its own name.
     FIELDS = {"snr": "grad/snr", "grad_norm": "grad/expert_norm",
               "rel_update": "update/rel", "per_token": "update/per_token"}
 

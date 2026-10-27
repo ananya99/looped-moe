@@ -233,31 +233,40 @@ def test_summarize_of_nothing_is_nan_not_zero():
     assert m["q_argmax_layer"] == -1 and m["q_argmax_expert"] == -1
 
 
-# ── update/rel ───────────────────────────────────────────────────────
+# ── drift/rel ────────────────────────────────────────────────────────
 
-def test_update_rel_normalises_drift_by_weight_norm():
+def test_drift_rel_normalises_drift_by_weight_norm():
     """||dw||/||w|| is what Muon controls and the only version comparable between
     layers of different width: equal relative steps, very different absolute ones."""
     counts = torch.tensor([[4, 4, 4, 4], [4, 4, 4, 4]])
     drift = torch.tensor([[1.0, 1, 1, 1], [10.0, 10, 10, 10]])
     weights = torch.tensor([[10.0, 10, 10, 10], [100.0, 100, 100, 100]])
     m = drift_metrics(counts, drift, weights=weights)
-    assert m["update/rel_max"] == pytest.approx(0.1)
-    assert m["update/rel_median"] == pytest.approx(0.1)
+    assert m["drift/rel_max"] == pytest.approx(0.1)
+    assert m["drift/rel_median"] == pytest.approx(0.1)
 
 
-def test_update_rel_is_absent_without_weight_norms():
+def test_drift_rel_is_absent_without_weight_norms():
     m = drift_metrics(torch.tensor([[1, 2, 3]]), torch.ones(1, 3))
+    assert not any(k.startswith("drift/rel") for k in m)
+
+
+def test_drift_metrics_never_writes_the_event_clock_namespace():
+    """`update/*` belongs to ExpertGradStats and means one event's displacement.
+    This function measures a whole interval; sharing the name made the later
+    writer win silently."""
+    m = drift_metrics(torch.tensor([[1, 2, 3]]), torch.ones(1, 3),
+                      weights=torch.ones(1, 3))
     assert not any(k.startswith("update/") for k in m)
 
 
-def test_update_rel_masks_unmeasured_experts_rather_than_dividing_by_zero():
+def test_drift_rel_masks_unmeasured_experts_rather_than_dividing_by_zero():
     """An expert's weight norm is never truly zero, so a zero means 'not measured'.
     Clamping instead of masking would report that cell as the maximum."""
     counts = torch.tensor([[4, 4, 4]])
     m = drift_metrics(counts, torch.tensor([[1.0, 1.0, 1.0]]),
                       weights=torch.tensor([[2.0, 2.0, 0.0]]))
-    assert m["update/rel_max"] == pytest.approx(0.5)
+    assert m["drift/rel_max"] == pytest.approx(0.5)
 
 
 def test_drift_metrics_drops_the_unnormalised_order_statistics():
@@ -265,7 +274,8 @@ def test_drift_metrics_drops_the_unnormalised_order_statistics():
     JSONL and an absolute norm is not comparable across layers anyway."""
     m = drift_metrics(torch.tensor([[0, 1, 2, 3]]), torch.ones(1, 4),
                       weights=torch.ones(1, 4))
-    assert set(k for k in m if k.startswith("drift/")) == {
+    assert {"drift/mean", "drift/max", "drift/dead_mean"}.isdisjoint(m)
+    assert set(k for k in m if k.startswith("drift/") and not k.startswith("drift/rel")) == {
         "drift/corr_share_vs_update", "drift/dead_over_alive"}
 
 
@@ -311,7 +321,7 @@ def test_the_jsonl_is_the_wide_data_wandb_cannot_hold(tmp_path):
     """Dashboard gets correlations; the file gets the joint distribution they are
     computed from, per expert."""
     _, cap, records = _run(tmp_path, every=1, steps=3)
-    assert {"drift/corr_share_vs_update", "update/rel_max"} <= set(cap.seen[1])
+    assert {"drift/corr_share_vs_update", "drift/rel_max"} <= set(cap.seen[1])
     assert not any(k.startswith("drift/") and "layer" in k for k in cap.seen[0])
     counts = torch.tensor(records[0]["counts"])
     drift = torch.tensor(records[0]["drift"])

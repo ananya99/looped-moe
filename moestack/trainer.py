@@ -28,7 +28,7 @@ from .losses import compute_loss, lm_cross_entropy_sum
 from .model import Transformer
 from .optim import build_optimizers, lr_at
 from .parallel import ParallelDims, all_reduce_, init_distributed, parallelize
-from .stats import routing_moments
+from .stats import load_metrics, routing_moments
 
 
 class Trainer:
@@ -237,22 +237,50 @@ class Trainer:
     def evaluate(self) -> dict:
         if self.eval_batches is None:
             self.eval_batches = build_eval_batches(self.cfg.data, self.args.vocab_size,
-                                                   self.cfg.train.seed)
+                                                   self.cfg.train.seed,
+                                                   self._train_sequences())
         self.model.eval()
         # Same scoring rule as training, via the same function: -100 is ignored and
         # excluded from the denominator, and the chunking caps the fp32 transient.
         tot, n = 0.0, 0
+        counts, routing = None, None
         for inp, tgt in self.eval_batches:
             inp, tgt = inp.to(self.dist.device), tgt.to(self.dist.device)
             with self._amp():
-                logits = self.model(inp).logits
-            batch_sum, batch_n = lm_cross_entropy_sum(logits, tgt, self.cfg.loss.lm_chunk_rows)
+                out = self.model(inp)
+            batch_sum, batch_n = lm_cross_entropy_sum(out.logits, tgt,
+                                                      self.cfg.loss.lm_chunk_rows)
             tot += batch_sum.item()
             n += int(batch_n)
+            # The router saw this batch anyway; the counts and the logit
+            # distribution are free here and are the whole reason to have a clean
+            # holdout. Summed over the eval set, exactly as `expert_counts` is
+            # summed over the global batch in `train_step`.
+            c = torch.stack([r.counts for r in out.router_outs])
+            counts = c if counts is None else counts + c
+            rm = routing_moments(out.router_outs, self.args.top_k)
+            routing = rm if routing is None else routing + rm
+            del out
         self.model.train()
         # No `perplexity`: it is exp(loss), so it is the same curve on a different
         # axis and the offline scripts can exponentiate.
-        return {"loss": tot / max(n, 1)}
+        m = {"loss": tot / max(n, 1)}
+        # No all_reduce anywhere in here: every rank evaluates the identical slice
+        # (`build_eval_batches` builds it at rank 0 / world 1), so each already has
+        # the global number and a collective would only be a chance to deadlock.
+        if counts is not None:
+            m.update(load_metrics(counts))
+            r = routing / len(self.eval_batches)
+            m.update({"routing/entropy": float(r[0]), "routing/confidence": float(r[1]),
+                      "routing/margin": float(r[2])})
+        return m
+
+    def _train_sequences(self) -> int:
+        """Sequences the whole run reads. The disk eval slice is the tail of the
+        cache, and this is what lets it refuse a slice the run would train on
+        rather than leave the holdout to a comment."""
+        c = self.cfg
+        return c.train.n_steps * c.data.grad_accum * c.data.batch_size * self.dims.dp
 
     def save(self, name: str):
         if not self.dist.is_main:

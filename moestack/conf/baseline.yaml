@@ -69,13 +69,18 @@ data:
   batch_size: 16          # per rank
   grad_accum: 16
   num_workers: 4          # stream only; disk needs no workers
-  eval_batches: 10
+  # 40 x 16 x 2048 = 1.31M tokens of holdout, taken from the tail of the cache.
+  # Raising this extends the slice backwards, so a 10-batch run's eval set is the
+  # last quarter of this one -- a subset, but not the same number.
+  eval_batches: 40
 
 train:
   n_steps: 2000
   seed: 42
   log_every: 10
-  eval_every: 500
+  # 20 points over the default 2,000 steps, for ~1% of the compute: at 500 a cell
+  # that dies early has no held-out curve at all, and most of them die early.
+  eval_every: 200
   save_every: 500
   save_dir: checkpoints
   auto_resume: false
@@ -86,7 +91,8 @@ logging:
   project: moe-baseline
   tag: null
   load_stats: true
-  # Per-expert JSONL + the drift/* and update/rel metrics derived from it, every N
+  # Per-expert JSONL + the drift/* metrics derived from it (incl. drift/rel, the
+  # interval ||dw||/||w||; update/rel is grad_stats_every's, per event), every N
   # steps (0 = off). The file is <save_dir>/<run_name>_expert_stats.jsonl. wandb
   # gets a dozen aggregates; this file gets the `[L, E]` matrices they came from,
   # and is the only copy -- at 0 the per-layer and per-expert picture is lost, not

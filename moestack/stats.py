@@ -250,12 +250,20 @@ def drift_metrics(counts: torch.Tensor, drift: torch.Tensor,
     working ones); `freeze_dead` should drive it to 0.
 
     `weights` are the per-expert weight norms. Given them, this also reports
-    `update/rel` = ||dw_e|| / ||w_e||, summarized: the quantity Muon actually
+    `drift/rel` = ||dw_e|| / ||w_e||, summarized: the quantity Muon actually
     controls, and the only one comparable across layers and across training as the
     weights grow. Its `_max` / `_argmax_*` are the single-expert anomaly alarm.
 
+    **`drift/rel`, not `update/rel`.** Both are ||dw||/||w||, and they are different
+    measurements: this one is net displacement over the whole reporting interval on
+    the step clock, while `callbacks.ExpertGradStats` publishes `update/rel` for the
+    displacement of one *event* on the event clock. Under one name the later writer
+    won silently and the series alternated between the two. The namespace now says
+    which clock: `drift/*` is the interval, `update/*` is the event. Runs logged
+    before this split carry the interval quantity under `update/rel_*`.
+
     The raw `drift/mean`, `drift/max` and `drift/dead_mean` are gone: the full
-    `drift` and `weight_norm_*` matrices are in the JSONL, `update/rel` is the
+    `drift` and `weight_norm_*` matrices are in the JSONL, `drift/rel` is the
     normalised version worth watching, and an un-normalised norm is not comparable
     between two layers of different width anyway.
     """
@@ -279,5 +287,5 @@ def drift_metrics(counts: torch.Tensor, drift: torch.Tensor,
         # Experts start at a non-zero norm and weight decay never reaches zero, so
         # a zero here means the tensor was not measured, not that the expert
         # vanished: mask rather than clamp, or the ratio reports a spurious max.
-        out.update(summarize(d / w.clamp(min=1e-12), "update/rel", mask=w > 0))
+        out.update(summarize(d / w.clamp(min=1e-12), "drift/rel", mask=w > 0))
     return out

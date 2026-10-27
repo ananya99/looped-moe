@@ -257,6 +257,22 @@ def test_snr_reaches_the_dashboard_summarized_not_per_expert(tmp_path):
     assert sum(k.startswith("grad/snr") for k in m) == 8
 
 
+def test_interval_and_event_displacement_are_separate_series(tmp_path):
+    """`ExpertStats` measures net displacement over the reporting interval and
+    `ExpertGradStats` measures one event's displacement. Both are ||dw||/||w||, and
+    they shared the name `update/rel`: with ExpertStats registered last it won every
+    reporting step except the first, where it returns early for want of a second
+    snapshot, so the series silently alternated between two different quantities.
+    Every other test here runs with `expert_stats_every=0`, which is why none of
+    them saw it."""
+    _, cap = _run(tmp_path, grad_every=1, steps=3, stats_every=1)
+    m = cap.seen[-1]
+    assert {"update/rel_median", "update/per_token_median"} <= set(m)   # event clock
+    assert {"drift/rel_median", "drift/corr_share_vs_update"} <= set(m)  # step clock
+    assert sum(k.startswith("update/rel") for k in m) == 8
+    assert sum(k.startswith("drift/rel") for k in m) == 8
+
+
 def test_grad_stats_respect_the_reporting_cadence(tmp_path):
     _, cap = _run(tmp_path, grad_every=3, steps=4)
     assert ["grad/snr_median" in m for m in cap.seen] == [True, False, False, True]

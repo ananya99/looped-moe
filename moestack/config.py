@@ -204,7 +204,7 @@ class DataConfig:
     batch_size: int = 16         # micro-batch per rank
     grad_accum: int = 16
     num_workers: int = 4
-    eval_batches: int = 10
+    eval_batches: int = 40
     tokenizer: str = "cl100k"
     insert_separator: str = "before"
 
@@ -214,7 +214,7 @@ class TrainConfig:
     n_steps: int = 2_000
     seed: int = 42
     log_every: int = 10
-    eval_every: int = 500
+    eval_every: int = 100
     save_every: int = 500
     # How many `_step*.pt` files to keep, newest first (0 = keep every one, the
     # original behaviour). A full-state checkpoint is the model plus the optimizer
@@ -244,9 +244,11 @@ class LoggingConfig:
     notes: Optional[str] = None
     load_stats: bool = True       # load/gini + load/dead_expert_fraction
     # Steps between per-expert records in <save_dir>/<run_name>_expert_stats.jsonl
-    # (counts, per-expert ||dw||, weight norms, LR multipliers) and the drift/* and
-    # update/rel metrics derived from them. 0 = off. Measurement cadence only: it is
-    # in the `logging` section, so it never changes a run's name or fingerprint.
+    # (counts, per-expert ||dw||, weight norms, LR multipliers) and the drift/*
+    # metrics derived from them -- including drift/rel, the interval ||dw||/||w||,
+    # which is not update/rel (that is grad_stats_every's, per event). 0 = off.
+    # Measurement cadence only: it is in the `logging` section, so it never changes
+    # a run's name or fingerprint.
     #
     # Non-zero by default, which it did not use to be: the dashboard deliberately no
     # longer carries the per-layer and order-statistic aggregates (see

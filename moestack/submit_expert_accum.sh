@@ -173,6 +173,7 @@ if [ "$SEQUENCES" -gt "$CACHE_SEQUENCES" ]; then
 fi
 
 n_matched=0
+all_names=()        # every cell `run` is called for, so --only can report the truth
 
 to_seconds () {   # 12h | 45m | 2d6h30m | 3600 -> seconds (same grammar as csub.py)
     local s="$1" total=0 n u
@@ -207,6 +208,9 @@ run () {   # [NOTES=..] [RESUME=1] run <name> <extra hydra overrides...>
     # Last, so Hydra's last-value-wins beats the N_STEPS in COMMON.
     [ "$TRIAL" = 1 ] && overrides+=("train.n_steps=$TRIAL_STEPS" "logging.tags=[trial]")
 
+    # Registered before the filter, so the name list below is what the script
+    # actually defines rather than a comment that can drift away from it.
+    all_names+=("$base")
     if [ -n "$ONLY" ] && [ "$ONLY" != "$base" ]; then
         return
     fi
@@ -257,7 +261,7 @@ ACCUM=( "logging.accum_events_every=$EVENTS_EVERY" "optim.expert_accum.enabled=t
 
 # Balanced: the load-balancing loss does the work. What the grid has to beat.
 NOTES="balanced reference, aux $AUX_BASELINE, no accumulation" \
-# run baseline "loss.aux_coef=$AUX_BASELINE"
+run baseline "loss.aux_coef=$AUX_BASELINE"
 
 # Imbalanced and untouched: every expert updates every step, including the ones
 # that saw nothing. This is the regime the grid intervenes in.
@@ -326,6 +330,6 @@ run st-r4-sum "loss.aux_coef=0" "${ACCUM[@]}" \
 
 # -------------------------------------------------------------------------------------
 [ "$n_matched" -eq 0 ] && {
-    echo "No run named '$ONLY'. Names: baseline, a0, active, st-r*, mb-r*, st-r4-sum (see --dry)."; exit 1; }
+    echo "No run named '$ONLY'. Names: ${all_names[*]+${all_names[*]}}"; exit 1; }
 echo "Done: $n_matched job(s). Logs: \$SCRATCH_HOME/$REPO_DIR/logs/$JOB_PREFIX-*-$BATCH.log"
 echo "Status: runai list jobs | grep $BATCH"

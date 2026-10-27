@@ -258,48 +258,41 @@ class EventTally:
         self.token_max = max(self.token_max, float(fired.max()))
 
 
-def accum_metrics(state: AccumState, tally: EventTally, threshold: int | None) -> dict:
+def accum_metrics(state: AccumState, tally: EventTally) -> dict:
     """Aggregates for wandb, read at the end of a step: `tally` is what fired
     during it, `state` is what is still waiting.
 
-    Per-expert series are far too wide to log (64 experts x 16 layers), so the
-    dashboard gets these and the joint distribution goes to the JSONL -- the same
-    division of labour as `expert_lr.scale_summary`.
+    Four series, each naming a decision:
+
+    - `events_per_expert` -- updates per expert per step. 1.0 is the baseline's
+      cadence, so this is the single number saying what the clock is doing.
+    - `tokens_per_event_mean` -- the budget actually delivered. With
+      `timeout_fraction` it says whether the cell is running the experiment asked
+      for: at 1.0 and 0 respectively, it is a baseline wearing a different name.
+    - `timeout_fraction` -- how many events were the timeout giving up rather than
+      the budget being met. High means Q is out of range for this run and the
+      windows are really fixed-length.
+    - `event_gini` -- inequality of *update counts*, not of tokens. This is the
+      tripwire for the feedback loop the scheme can feed: a hot expert crosses its
+      budget more often, takes more steps, improves faster, and the router sends it
+      still more. Read it next to `load/gini` -- if this runs away while that does
+      not, the extra steps are doing it, not the routing.
+
+    Dropped to the events JSONL, which holds `tokens`, `pending`, `age`, `events`
+    and `by_timeout` as full `[L, E]` matrices every cadence: `pending_mean`,
+    `pending_max`, `age_max`, `tokens_per_event_min`, `tokens_per_event_max`,
+    `overshoot_mean`, `waiting_fraction`, `never_fired_fraction`. `age_max` in
+    particular only restated what `timeout_fraction` already shows, and
+    `overshoot_mean` is `tokens_per_event_mean / threshold`, both of which stay on
+    the dashboard.
     """
-    nan = float("nan")
-    pending, age = state.pending.float(), state.age.float()
     out = {
-        # Updates per expert per step. 1.0 is the baseline's cadence, and the
-        # single number that says what the clock is actually doing.
         "accum/events_per_expert": tally.events / max(tally.slots, 1),
-        "accum/waiting_fraction": float((state.pending > 0).to(torch.float32).mean()),
-        "accum/never_fired_fraction": float((state.events == 0).to(torch.float32).mean()),
-        # Inequality of *update counts*, not of tokens. 0 means every expert has
-        # updated equally often. This is the tripwire for the loop the scheme can
-        # feed: a hot expert crosses its budget more often, takes more steps,
-        # improves faster, and the router sends it still more. Watch it next to
-        # load/gini -- if this one runs away while that one does not, the extra
-        # steps are doing it, not the routing.
         "accum/event_gini": gini(state.events),
-        "accum/pending_mean": float(pending.mean()),
-        "accum/pending_max": float(pending.max()) if pending.numel() else nan,
-        # The staleness bound in ticks. If this sits at max_window, the timeout --
-        # not the token budget -- is what is driving the experiment.
-        "accum/age_max": float(age.max()) if age.numel() else nan,
     }
     if tally.events:
         out.update({
             "accum/tokens_per_event_mean": tally.token_sum / tally.events,
-            "accum/tokens_per_event_min": tally.token_min,
-            "accum/tokens_per_event_max": tally.token_max,
-            # Of the events that happened, how many were the timeout giving up
-            # rather than the budget being met. A high number means Q is out of
-            # range for this run and the windows are really fixed-length.
             "accum/timeout_fraction": tally.timeouts / tally.events,
         })
-        if threshold:
-            # How far past Q a window lands, because a single tick can carry an
-            # expert well over the line. Far above 1.0 means the tick is too coarse
-            # for the budget being asked for.
-            out["accum/overshoot_mean"] = out["accum/tokens_per_event_mean"] / threshold
     return out

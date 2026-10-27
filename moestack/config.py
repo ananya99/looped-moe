@@ -242,22 +242,29 @@ class LoggingConfig:
     group: Optional[str] = None
     tags: Optional[List[str]] = None
     notes: Optional[str] = None
-    load_stats: bool = True       # per-layer gini / dead-expert fraction
-    # Off by default: it is 4 x n_layers extra series (64 at depth 16) against
-    # eight aggregates, which is a wall of panels in every run's dashboard. Turn
-    # it on for the run where you are actually asking how imbalance varies with
-    # depth; they land under `load_per_layer/`, separate from `load/`.
-    load_stats_per_layer: bool = False
+    load_stats: bool = True       # load/gini + load/dead_expert_fraction
     # Steps between per-expert records in <save_dir>/<run_name>_expert_stats.jsonl
-    # (counts, per-expert ||dw||, weight norms, LR multipliers) and the drift/*
-    # correlations derived from them. 0 = off. Measurement cadence only: it is in
-    # the `logging` section, so it never changes a run's name or fingerprint.
-    expert_stats_every: int = 0
+    # (counts, per-expert ||dw||, weight norms, LR multipliers) and the drift/* and
+    # update/rel metrics derived from them. 0 = off. Measurement cadence only: it is
+    # in the `logging` section, so it never changes a run's name or fingerprint.
+    #
+    # Non-zero by default, which it did not use to be: the dashboard deliberately no
+    # longer carries the per-layer and order-statistic aggregates (see
+    # `stats.load_metrics`), so this file is now the only record of the `[L, E]`
+    # matrices they were computed from. Setting it to 0 does not just skip a
+    # measurement any more -- it throws the counts away.
+    expert_stats_every: int = 50
     # Steps between records in <save_dir>/<run_name>_accum_events.jsonl: for each
     # tick on which something fired, the full [L, E] picture of which experts
     # closed a window, on how many tokens, by which rule, and what is still
-    # waiting. The dashboard gets only the accum/* aggregates. 0 = off.
-    accum_events_every: int = 0
+    # waiting. The dashboard gets only the accum/* aggregates. 0 = off, but the
+    # four accum/* series are now all the dashboard has, so leave it on.
+    accum_events_every: int = 50
+    # Steps between per-expert gradient-quality measurements (grad/snr,
+    # grad/expert_norm). 0 = off. Needs `expert_stats_every` on the same cadence to
+    # reach the JSONL, since that is the writer. The hooks are armed only on
+    # measured steps, so a large cadence really is free on the others.
+    grad_stats_every: int = 50
 
 
 # Fields that cannot change what a run learns, and so must not change its name.

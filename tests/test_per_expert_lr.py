@@ -135,13 +135,13 @@ def test_ema_converges_to_a_constant_stream():
 
 # ── summary metrics ──────────────────────────────────────────────────
 
-def test_summary_reports_frozen_fraction_and_ignores_dead_in_the_alive_mean():
+def test_summary_reports_the_frozen_fraction():
     c = _counts([0, 0, 4, 4])
     s = lr_scales_from_counts(c, alpha=0.0, freeze_dead=True)
     m = scale_summary(s, c)
     assert m["lr_scale/frozen_fraction"] == pytest.approx(0.5)
-    assert m["lr_scale/mean_alive"] == pytest.approx(1.0)
-    assert m["lr_scale/min"] == 0.0
+    # ...and nothing the full [L, E] matrix in the JSONL already answers.
+    assert set(m) == {"lr_scale/spread_alive", "lr_scale/frozen_fraction"}
 
 
 # ── parity with the original scalar implementation ───────────────────
@@ -516,8 +516,8 @@ def test_metrics_are_published_for_the_loggers(tmp_path):
     cfg.__post_init__()
     t = Trainer(cfg, verbose=False)
     state = t.train_step()
-    assert {"lr_scale/min", "lr_scale/max", "lr_scale/mean_alive",
-            "lr_scale/frozen_fraction"} <= set(state.metrics)
+    assert {"lr_scale/spread_alive", "lr_scale/frozen_fraction",
+            "lr_scale/cum_spread_alive"} <= set(state.metrics)
 
 
 def test_ema_is_checkpointed_and_restored_warm(tmp_path):
@@ -548,40 +548,33 @@ def test_callback_refuses_optimizers_without_addressable_experts(tmp_path):
         PerExpertLR(cfg.optim.per_expert_lr).on_train_start(t)
 
 
-def test_summary_reports_rates_relative_to_and_in_units_of_the_base_lr():
+def test_spread_alive_is_the_ratio_of_the_fastest_to_the_slowest_working_expert():
     c = _counts([1, 2, 4, 8])
     s = lr_scales_from_counts(c, alpha=1.0)
-    m = scale_summary(s, c, base_lr=0.02)
-    # lr_scale/* are ratios to the base rate; expert_lr/* are the same in LR units
-    assert m["expert_lr/base"] == pytest.approx(0.02)
-    assert m["expert_lr/max"] == pytest.approx(m["lr_scale/max"] * 0.02)
-    assert m["expert_lr/mean_alive"] == pytest.approx(0.02)     # normalisation holds it there
-    assert m["lr_scale/spread_alive"] == pytest.approx(m["lr_scale/max"] / m["lr_scale/min"])
+    alive = s[c > 0]
+    m = scale_summary(s, c)
+    assert m["lr_scale/spread_alive"] == pytest.approx(float(alive.max() / alive.min()))
 
 
 def test_spread_is_one_when_the_rule_does_nothing():
     c = _counts([1, 2, 4, 8])
     m = scale_summary(lr_scales_from_counts(c, alpha=0.0), c)
     assert m["lr_scale/spread_alive"] == pytest.approx(1.0)
-    assert "expert_lr/base" not in m          # absolute units only when asked for
+
+
+def test_absolute_expert_rates_are_not_logged_because_they_are_derivable():
+    """`expert_lr/*` used to be these multipliers times the base rate, which is on
+    the dashboard already as `train/lr`. Four series carrying nothing new."""
+    c = _counts([1, 2, 4, 8])
+    m = scale_summary(lr_scales_from_counts(c, alpha=1.0), c)
+    assert not any(k.startswith("expert_lr/") for k in m)
 
 
 def test_frozen_experts_do_not_poison_the_alive_spread():
     c = _counts([0, 2, 4, 8])
-    m = scale_summary(lr_scales_from_counts(c, alpha=0.5, freeze_dead=True), c, base_lr=0.02)
-    assert m["lr_scale/min"] == 0.0 and m["expert_lr/min"] == 0.0
-    assert m["lr_scale/min_alive"] > 0 and torch.isfinite(torch.tensor(m["lr_scale/spread_alive"]))
-
-
-def test_absolute_expert_lr_follows_the_schedule(tmp_path):
-    """expert_lr/* must track train/lr, so the two can be read on one dashboard."""
-    cfg = tiny_config(tmp_path)
-    cfg.train.n_steps, cfg.optim.per_expert_lr.alpha = 1, 1.0
-    cfg.__post_init__()
-    t = Trainer(cfg, verbose=False)
-    state = t.train_step()
-    assert state.metrics["expert_lr/base"] == pytest.approx(state.lr)
-    assert state.metrics["expert_lr/max"] >= state.metrics["expert_lr/mean_alive"] > 0
+    m = scale_summary(lr_scales_from_counts(c, alpha=0.5, freeze_dead=True), c)
+    assert m["lr_scale/frozen_fraction"] == pytest.approx(0.25)
+    assert torch.isfinite(torch.tensor(m["lr_scale/spread_alive"]))
 
 
 def test_resume_keeps_a_warm_ema_and_reproduces_the_uninterrupted_run(tmp_path):

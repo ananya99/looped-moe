@@ -112,22 +112,29 @@ def lr_scales_from_counts(
 
 
 def scale_summary(scales: torch.Tensor, counts: torch.Tensor,
-                  base_lr: float | None = None,
                   clamp_min: float | None = None,
                   clamp_max: float | None = None) -> dict:
-    """Aggregates for wandb. The full `[L, E]` matrix is far too wide to log, so
-    the dashboard gets the spread and the joint distribution goes to a file.
+    """Aggregates for wandb. The full `[L, E]` matrix goes to the JSONL instead.
 
-    `lr_scale/*` are the multipliers themselves, i.e. each expert's rate *relative
-    to the base LR* (1.0 = the rate it would have had without the rule). Passing
-    `base_lr` adds `expert_lr/*` in absolute units, directly comparable with the
-    `train/lr` curve.
+    `lr_scale/spread_alive` is the only one of these worth a panel: 1.0 means the
+    rule is doing nothing, so it is what says an alpha sweep is actually separating
+    its cells rather than running the same experiment several times.
 
-    Those absolute numbers are still one step short of what Muon applies: its
+    `frozen_fraction` and `clamped_fraction` are tripwires, not curves -- they are
+    logged to the run summary (see `callbacks.SUMMARY_ONLY`). Non-zero
+    `clamped_fraction` is the warning that clamping, which is applied *after*
+    normalisation, has pushed the alive mean off 1.0 and the sweep is no longer
+    comparing equal-average cells.
+
+    Gone: `lr_scale/{min,max,min_alive,max_alive,mean_alive}` and all four
+    `expert_lr/*`. The latter were `lr_scale/*` multiplied by the base rate, which
+    is already on the dashboard as `train/lr`; the former are order statistics of a
+    matrix the JSONL holds in full.
+
+    Those absolute numbers were in any case one step short of what Muon applies: its
     `adjusted_lr` multiplies by `sqrt(max(1, out/in))` **per parameter shape**, so
     an expert's `down_proj` and `gate_up_proj` already learn at different rates
-    before any per-expert multiplier. Reporting that split per expert would double
-    every series for a factor the rule does not touch, so it stays out.
+    before any per-expert multiplier.
     """
     s, c = scales.float(), counts.float()
     alive = c > 0
@@ -135,31 +142,11 @@ def scale_summary(scales: torch.Tensor, counts: torch.Tensor,
     alive_scales = s[alive] if n_alive else s.new_zeros(0)
     nan = float("nan")
     out = {
-        "lr_scale/min": float(s.min()) if s.numel() else nan,
-        "lr_scale/max": float(s.max()) if s.numel() else nan,
-        "lr_scale/mean_alive": float(alive_scales.mean()) if n_alive else nan,
-        "lr_scale/max_alive": float(alive_scales.max()) if n_alive else nan,
-        "lr_scale/min_alive": float(alive_scales.min()) if n_alive else nan,
-        # How far apart the rule drives the fastest and slowest working expert.
-        # 1.0 means it is doing nothing; this is the one number that says whether
-        # an alpha sweep is actually separating the cells.
         "lr_scale/spread_alive": (float(alive_scales.max() / alive_scales.min())
                                   if n_alive and float(alive_scales.min()) > 0 else nan),
         "lr_scale/frozen_fraction": float((s == 0).float().mean()) if s.numel() else nan,
     }
     if clamp_min is not None and clamp_max is not None and n_alive:
-        # With normalize on, `mean_alive` is 1.0 by construction -- the rule
-        # redistributes rate, it does not raise or lower it. Clamping is the one
-        # thing that breaks that, because it is applied *after* normalisation.
-        # Non-zero here is the warning that `mean_alive` has drifted off 1.0 and
-        # the sweep is no longer comparing equal-average cells.
         at_bound = (alive_scales <= clamp_min) | (alive_scales >= clamp_max)
         out["lr_scale/clamped_fraction"] = float(at_bound.float().mean())
-    if base_lr is not None:
-        out.update({
-            "expert_lr/min": out["lr_scale/min"] * base_lr,
-            "expert_lr/max": out["lr_scale/max"] * base_lr,
-            "expert_lr/mean_alive": out["lr_scale/mean_alive"] * base_lr,
-            "expert_lr/base": base_lr,      # what every expert would get at alpha=0
-        })
     return out

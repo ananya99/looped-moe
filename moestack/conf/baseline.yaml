@@ -86,12 +86,18 @@ logging:
   project: moe-baseline
   tag: null
   load_stats: true
-  # 4 x n_layers extra series under `load_per_layer/`; on only when you are
-  # actually asking how imbalance varies with depth.
-  load_stats_per_layer: false
-  # Per-expert JSONL + drift/* correlations every N steps (0 = off). The file is
-  # <save_dir>/<run_name>_expert_stats.jsonl; wandb gets only the aggregates.
-  expert_stats_every: 0
+  # Per-expert JSONL + the drift/* and update/rel metrics derived from it, every N
+  # steps (0 = off). The file is <save_dir>/<run_name>_expert_stats.jsonl. wandb
+  # gets a dozen aggregates; this file gets the `[L, E]` matrices they came from,
+  # and is the only copy -- at 0 the per-layer and per-expert picture is lost, not
+  # merely unplotted.
+  expert_stats_every: 50
+  # Same bargain for the accumulation controller: four accum/* series on the
+  # dashboard, the full per-event `[L, E]` picture here.
+  accum_events_every: 50
+  # Per-expert gradient SNR every N steps (0 = off). Hooks are armed only on
+  # measured steps. Rides the expert_stats JSONL, so keep the two cadences equal.
+  grad_stats_every: 50
 
 hydra:
   job:

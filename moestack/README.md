@@ -421,11 +421,18 @@ per-*event* rule, reading the window's token count at the moment it fires.
 
 `accum/events_per_expert` is the one number that says what the clock is doing: 1.0
 is the baseline's cadence, 3.0 means experts update three times as often, 0.2 means
-a window spans five steps. Then `accum/tokens_per_event_{mean,min,max}` (should
-concentrate just above Q), `accum/overshoot_mean`, `accum/timeout_fraction` (high
-means Q is out of range and the windows are really fixed-length),
-`accum/waiting_fraction`, `accum/age_max`, `accum/never_fired_fraction` and
-`accum/discarded_windows`.
+a window spans five steps. Then `accum/tokens_per_event_mean` (the budget actually
+delivered) and `accum/timeout_fraction` (high means Q is out of range and the
+windows are really fixed-length). At 1.0 and 0 respectively, the cell is a baseline
+wearing a different name.
+
+Those plus `accum/event_gini` are the whole `accum/` section. `pending_{mean,max}`,
+`age_max`, `tokens_per_event_{min,max}`, `overshoot_mean`, `waiting_fraction` and
+`never_fired_fraction` were removed from the dashboard: each is a function of the
+per-event `[L, E]` matrices in the JSONL, `age_max` only restated what
+`timeout_fraction` shows, and `overshoot_mean` is `tokens_per_event_mean / Q` with
+both terms still logged. `accum/discarded_windows` and `accum/nonfinite_microbatches`
+are in the run *summary* rather than as series -- see [Measurement](#measurement).
 
 `accum/event_gini` is the tripwire. The scheme can feed a loop: a hot expert
 crosses its budget more often, takes more steps, improves, and the router sends it
@@ -439,37 +446,123 @@ lives in `logging`, so it never changes a run's name.
 
 ## Measurement
 
-`MoELoadStats` runs every step from the exact global counts and emits eight
-aggregates: `load/gini`, `load/gini_alive`, `load/normalized_entropy`,
-`load/dead_expert_fraction`, `load/max_expert_fraction`, `load/max_over_mean` and
-the worst-layer variants of the first and fourth. That is the whole `load/`
-section, and it is what you read every run.
+**The contract: collect wide, watch narrow.** The `[L, E]` matrices go to a JSONL
+every cadence, because they are cheap and you never regret having them. wandb gets
+about a dozen scalars, each of which names a decision. A metric earns a panel only
+if you can say which decision it changes; otherwise it is recomputed offline from
+the matrices. The dashboard is a dozen series, not a catalogue.
 
-`logging.load_stats_per_layer=true` adds four series *per layer* -- 64 at depth 16
--- under `load_per_layer/`, kept out of `load/` so they do not bury the aggregates.
-Off by default: imbalance genuinely varies with depth, but that is a question you
-ask of one run, not a wall of panels in every run.
+`MoELoadStats` runs every step from the exact global counts and emits exactly two:
+`load/gini` and `load/dead_expert_fraction`. Gone, and recoverable offline from the
+same counts: `gini_alive`, `normalized_entropy`, `max_expert_fraction`,
+`max_over_mean`, the worst-layer variants, and the per-layer series that
+`logging.load_stats_per_layer` used to switch on (the flag itself is gone).
+`max_over_mean` is DeepSeek's MaxVio + 1, so that is the one to recompute when
+positioning against published numbers.
 
-`gini = dead_fraction + (1 - dead_fraction) · gini_alive` exactly (tested), which
-is why both are logged: a rule that revives dead experts and one that evens out the
-working experts both lower `gini`, and only the split says which happened.
+Note that `max_expert_fraction` and `max_over_mean` only ever differed by a factor
+of `n_experts` — `max/total` against `max/mean` — so they were the same series
+logged twice.
 
-With per-expert LR on, `lr_scale/*` give each expert's rate **relative** to the base
-LR (`spread_alive` = fastest/slowest working expert) and `expert_lr/*` the same in LR
-units, comparable with `train/lr`. Those are before Muon's `adjusted_lr`, which adds
-`sqrt(max(1, out/in))` per shape — so an expert's `down_proj` and `gate_up_proj`
+With per-expert LR on, `lr_scale/spread_alive` (fastest/slowest working expert, 1.0
+= the rule is doing nothing) is the single series: it is what says an alpha sweep is
+separating its cells rather than running one experiment repeatedly.
+`lr_scale/{min,max,min_alive,max_alive,mean_alive}` and all four `expert_lr/*` are
+gone — the latter were these multipliers times the base rate, which is on the
+dashboard as `train/lr`. All of this is before Muon's `adjusted_lr`, which adds
+`sqrt(max(1, out/in))` per shape, so an expert's `down_proj` and `gate_up_proj`
 already differ before any multiplier.
 
-`logging.expert_stats_every=N` adds the part wandb cannot hold. Per step measured it
-brackets the optimizer step with a host-side snapshot of the expert tensors and writes
+`logging.expert_stats_every=N` writes the wide part. Per measured step it brackets
+the optimizer step with a host-side snapshot of the expert tensors and writes
 `<save_dir>/<run_name>_expert_stats.jsonl`: per-expert counts, `||Δw||` (total and per
-matrix), weight norms and LR multipliers, all `[n_layers][n_experts]`. The dashboard
-gets `drift/corr_share_vs_update` (Spearman, ties averaged, NaN rather than 0 when
-there is no rank variance) and `drift/dead_over_alive` — the zero-token-expert effect
-in one number, which `freeze_dead` should drive to 0. Dropped (non-finite) steps are
-not recorded: no optimizer step ran, so the drift would be zero by construction.
+matrix), weight norms and LR multipliers, all `[n_layers][n_experts]`. **It defaults
+to 50 rather than 0**, because with the aggregates above removed this file is the
+only record of the matrices they were computed from; at 0 that picture is discarded,
+not merely unplotted.
 
-The cadence lives in `logging`, so it never changes a run's name or fingerprint.
+The dashboard gets `drift/corr_share_vs_update` (Spearman, ties averaged, NaN rather
+than 0 when there is no rank variance), `drift/dead_over_alive` — the
+zero-token-expert effect in one number, which `freeze_dead` should drive to 0 — and
+`update/rel_*`. Dropped (non-finite) steps are not recorded: no optimizer step ran,
+so the drift would be zero by construction.
+
+`update/rel` is `||Δw_e|| / ||w_e||`: the quantity Muon actually controls, and the
+only one comparable between layers of different width and across training as the
+weights grow. It replaces the raw `drift/{mean,max,dead_mean}`. It is reported
+through `stats.summarize`, the shared helper for any `[L, E]` quantity, which gives
+`mean`, `p10`, `median`, `p90`, `max`, `argmax_layer`, `argmax_expert` and
+`outlier_fraction` — seven scalars where the full matrix would be 1,024 series. The
+point is the alarm: a mean over experts hides one expert running away, so `max`
+pulling clear of `median` is the symptom and the two `argmax_*` integers name the
+cell (two ints, not an `"05:17"` string, because wandb plots numbers and files
+strings as metadata). `outlier_fraction` is judged per layer, against the median
+absolute deviation, falling back to the mean deviation when the MAD is zero — which
+is the normal case, since Newton-Schulz drives many update norms to near-identical
+values, and a MAD of zero would otherwise switch the alarm off exactly where a lone
+outlier is most visible.
+
+### Gradient quality: `grad/snr`
+
+The thesis claim in one number. Within a window, expert e's gradient is a sum over
+micro-batches; for a cold expert most terms are exactly zero and the rest point in
+near-random directions, so the sum is dominated by accident.
+
+    var_e = (1/M) sum_j ||g_e,j||^2 - ||gbar_e||^2
+    SNR_e = ||gbar_e|| / sqrt(var_e / M)
+
+**The `/ M` matters.** `||gbar|| / sqrt(var)` -- mean over micro-batches against
+their spread, which is how this metric is usually first written down -- is the
+*per-sample* ratio, and it is flat in the window size by construction: widen the
+window and `gbar` converges to the true mean while `var` converges to the noise
+variance, so the ratio converges to a constant. What the optimizer steps on is
+`gbar`, whose error is the standard error, and *that* grows as `sqrt(M)` -- the
+prediction expert-local accumulation exists to test. The per-sample form also
+reports an expert that fired once as `1/sqrt(M-1)`, i.e. getting worse as the
+window lengthens around it, when nothing about the expert changed; the standard-error
+form reads `sqrt(M/(M-1))` ~ 1.0 for that expert at any M.
+
+Cheap because experts are single 3D `[E, ...]` tensors: a **leaf grad hook** sees
+each backward's contribution before it is accumulated into `.grad`, so the two
+running `[L, E]` arrays the identity needs come for free -- no differencing of
+gradient-sized snapshots. `tests/test_grad_stats.py` pins that the hooks fire
+exactly once per backward under non-reentrant activation checkpointing (forward
+hooks do not, which is why the router counts come from `RouterOut` instead).
+
+`ExpertGradStats` is only the clock, and the clock is the subtlety: **a window is
+measured when it closes, not at the step boundary.** Those coincide for a baseline
+run and do not under accumulation, where a window can span several steps or end
+mid-step. Measuring at the boundary would divide a gradient accumulated over three
+steps by the micro-batch count of the last one. A baseline step is still a window
+of `grad_accum` micro-batches, which is what anchors the SNR-vs-window-tokens curve
+at the un-accumulated end.
+
+`logging.grad_stats_every=N` (default 50) controls it; the hooks are armed only on
+measured steps, so a large cadence is genuinely free on the others. The dashboard
+gets `stats.summarize` of `grad/snr` and `grad/expert_norm` (the latter over alive
+experts only, so a sea of dead cells does not drag the median), and the `[L, E]`
+matrices ride along in the `expert_stats` JSONL as `grad_snr`, `grad_grad_norm` and
+`grad_micro`.
+
+### The run summary
+
+Some numbers are evidence a run is *valid* rather than curves to watch: monotone
+counters, constants, and fractions that stay at zero until something has gone wrong.
+`callbacks.SUMMARY_ONLY` diverts them to the wandb run summary — one value per run,
+sortable in the runs table, no panel: `train/skipped_steps`, `system/gpu_peak_gb`,
+`lr_scale/{frozen,clamped}_fraction`, `accum/threshold` (resolved once, so a
+constant), `accum/{discarded_windows,nonfinite_microbatches,resumes,resume_dropped_windows}`.
+
+Deleting them would be the wrong trade: `resumes` is why a preempted cell is not
+directly comparable to a clean one, and `clamped_fraction` is the warning that
+clamping — applied after normalisation — has pushed the alive mean off 1.0, so an
+alpha sweep is no longer comparing equal-average cells. You need them to defend a
+result; you do not need to watch them arrive.
+
+`eval/` is `loss` alone. `perplexity` was `exp(loss)`: the same curve on a different
+axis.
+
+Both cadences live in `logging`, so they never change a run's name or fingerprint.
 
 ## Where the next pieces go
 
@@ -480,6 +573,33 @@ The cadence lives in `logging`, so it never changes a run's name or fingerprint.
 - **Expert parallelism**: an `AllToAllDispatcher` implementing `dispatch`/`combine`,
   `GroupedExperts(n_local_experts=E/ep)`, and expert grads reduced over `edp` only.
   Test: EP=2 matches EP=1 on loss and grads.
+- **Hold out the eval slice** (deferred, not a blocker). `DiskSource.batch` walks
+  sequences from 0 with no exclusion, while `eval_batches` reads 160 sequences from
+  index `ceil(10M/seq_len) - 1` of the same cache: at `seq_len=2048`,
+  `batch_size=16`, `grad_accum=16` that is sequences 4882-5041, which training
+  consumes at **step 19**. The 10M offset was never a holdout, and the streaming
+  `data.get_eval_batches` has the same overlap -- so "disk and stream are
+  comparable" means comparably contaminated, and fixing either side breaks that
+  comparison anyway.
+
+  Deliberately deferred, because the contamination is **common-mode**: `DiskSource`
+  order is index-based (`seed` only touches `SyntheticSource`), so every cell and
+  every seed meets the eval block at the same point, and a bias shared by all cells
+  cancels out of the cell-vs-cell comparisons the experiments actually make. 160
+  sequences out of 512,000, seen once at step 19 and followed by ~1,980 steps of
+  other data, is small on its own terms too.
+
+  It stops being common-mode if a run **wraps the cache**: 2000 steps x 16 x 16 on
+  one GPU is 512,000 of 566,129 sequences, about 211 steps of headroom, and past
+  that training sees the eval slice a second time -- ordinary multi-epoch
+  memorisation, which `submit_expert_accum.sh` only warns about rather than
+  prevents. Do this before extending runs past ~2,200 steps, or before reporting
+  absolute held-out numbers.
+
+  Preferred fix: reserve a hole at the existing offset so `DiskSource.batch` maps
+  around it, behind a `data.eval_holdout` flag so existing configs reproduce. That
+  survives a cache wrap; moving the holdout to the end of the cache does not, and
+  fails silently when it does.
 - **Experiments** (tying, routing rules): new `Rule`s, group attributes, or a
   callback/step policy — not edits to `trainer.py`. Per-expert LR and expert-local
   accumulation, above, are the two worked examples: a group attribute, a pure rule

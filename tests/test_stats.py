@@ -9,7 +9,7 @@ import torch
 
 from moestack.callbacks import Callback, ExpertStats
 from moestack.stats import (delta_norms, drift_metrics, gini, load_metrics,
-                            normalized_entropy, row_norms, spearman)
+                            normalized_entropy, row_norms, spearman, summarize)
 from moestack.trainer import Trainer
 
 from conftest import tiny_config
@@ -73,26 +73,25 @@ def test_spearman_averages_ties_instead_of_inventing_an_order():
 
 # ── load_metrics ─────────────────────────────────────────────────────
 
-def test_load_metrics_reports_layer_series_and_their_means():
+def test_load_metrics_averages_its_two_series_over_layers():
     c = torch.tensor([[0, 0, 4, 12], [4, 4, 4, 4]])
     m = load_metrics(c)
-    assert m["load_per_layer/dead_fraction/00"] == pytest.approx(0.5)
-    assert m["load_per_layer/dead_fraction/01"] == pytest.approx(0.0)
-    assert m["load/dead_expert_fraction"] == pytest.approx(0.25)
-    assert m["load_per_layer/gini/01"] == pytest.approx(0.0)
-    assert m["load/gini_max_layer"] == pytest.approx(m["load_per_layer/gini/00"])
+    assert m["load/dead_expert_fraction"] == pytest.approx(0.25)   # 0.5 and 0.0
+    assert m["load/gini"] == pytest.approx(gini(c[0].float()) / 2)  # second layer is 0
 
 
-def test_per_layer_series_can_be_switched_off():
-    m = load_metrics(torch.tensor([[1, 2, 3, 4]]), per_layer=False)
-    assert not any("load_per_layer/" in k for k in m)
-    assert "load/gini" in m
+def test_load_metrics_is_only_the_two_series_worth_a_panel():
+    """Everything else -- gini_alive, entropy, max_over_mean, the per-layer series
+    and the worst-layer maxima -- is a function of the same [L, E] counts, which go
+    to the JSONL and are recomputed offline."""
+    m = load_metrics(torch.tensor([[1, 2, 3, 4], [0, 0, 1, 7]]))
+    assert set(m) == {"load/gini", "load/dead_expert_fraction"}
 
 
 def test_a_layer_with_no_tokens_is_skipped_rather_than_counted_as_balanced():
+    one_live = torch.tensor([[1, 2, 3, 4]])
     m = load_metrics(torch.tensor([[0, 0, 0, 0], [1, 2, 3, 4]]))
-    assert "load_per_layer/gini/00" not in m
-    assert m["load/gini"] == pytest.approx(m["load_per_layer/gini/01"])
+    assert m["load/gini"] == pytest.approx(load_metrics(one_live)["load/gini"])
 
 
 # ── drift ────────────────────────────────────────────────────────────
@@ -125,6 +124,92 @@ def test_dead_over_alive_is_the_zero_token_expert_effect():
 def test_dead_over_alive_is_absent_when_nothing_is_dead():
     m = drift_metrics(torch.tensor([[1, 2, 3]]), torch.ones(1, 3))
     assert "drift/dead_over_alive" not in m
+
+
+# ── summarize ────────────────────────────────────────────────────────
+
+def test_summarize_catches_the_one_expert_a_mean_would_hide():
+    """The whole reason this helper exists: a single runaway cell barely moves the
+    mean, so `max` and `argmax_*` are what make it visible."""
+    x = torch.ones(4, 16)
+    x[2, 7] = 50.0
+    m = summarize(x, "update/rel")
+    assert m["update/rel_median"] == pytest.approx(1.0)
+    assert m["update/rel_max"] == pytest.approx(50.0)
+    assert (m["update/rel_argmax_layer"], m["update/rel_argmax_expert"]) == (2, 7)
+    # the mean over 64 cells moves by under a factor of two -- the alarm is `max`
+    assert m["update/rel_mean"] < 2.0
+
+
+def test_summarize_argmax_is_two_plottable_integers_not_a_string():
+    """wandb draws numbers and files strings as metadata, where they plot nothing."""
+    m = summarize(torch.rand(3, 8), "q")
+    assert isinstance(m["q_argmax_layer"], int)
+    assert isinstance(m["q_argmax_expert"], int)
+    assert not any(isinstance(v, str) for v in m.values())
+
+
+def test_summarize_judges_outliers_against_their_own_layer():
+    """Scale changes with depth, so a cell is anomalous relative to its layer's
+    median, not the model's. Layer 1 here is uniformly large but has no outlier."""
+    x = torch.cat([torch.ones(1, 16), torch.full((1, 16), 100.0)])
+    assert summarize(x, "q")["q_outlier_fraction"] == pytest.approx(0.0)
+    x[0, 3] = 20.0
+    assert summarize(x, "q")["q_outlier_fraction"] == pytest.approx(1 / 32)
+
+
+def test_summarize_mask_selects_which_cells_count():
+    x = torch.ones(2, 8)
+    x[0, 0] = 99.0
+    alive = torch.ones(2, 8, dtype=torch.bool)
+    alive[0, 0] = False
+    m = summarize(x, "q", mask=alive)
+    assert m["q_max"] == pytest.approx(1.0)                  # the 99 is masked out
+    assert (m["q_argmax_layer"], m["q_argmax_expert"]) != (0, 0)
+
+
+def test_summarize_of_nothing_is_nan_not_zero():
+    """Same contract as spearman: 'not measurable' must not arrive as a value. The
+    indices are -1 because WandbLogger drops NaN floats silently."""
+    m = summarize(torch.ones(2, 4), "q", mask=torch.zeros(2, 4, dtype=torch.bool))
+    assert math.isnan(m["q_max"]) and math.isnan(m["q_median"])
+    assert m["q_argmax_layer"] == -1 and m["q_argmax_expert"] == -1
+
+
+# ── update/rel ───────────────────────────────────────────────────────
+
+def test_update_rel_normalises_drift_by_weight_norm():
+    """||dw||/||w|| is what Muon controls and the only version comparable between
+    layers of different width: equal relative steps, very different absolute ones."""
+    counts = torch.tensor([[4, 4, 4, 4], [4, 4, 4, 4]])
+    drift = torch.tensor([[1.0, 1, 1, 1], [10.0, 10, 10, 10]])
+    weights = torch.tensor([[10.0, 10, 10, 10], [100.0, 100, 100, 100]])
+    m = drift_metrics(counts, drift, weights=weights)
+    assert m["update/rel_max"] == pytest.approx(0.1)
+    assert m["update/rel_median"] == pytest.approx(0.1)
+
+
+def test_update_rel_is_absent_without_weight_norms():
+    m = drift_metrics(torch.tensor([[1, 2, 3]]), torch.ones(1, 3))
+    assert not any(k.startswith("update/") for k in m)
+
+
+def test_update_rel_masks_unmeasured_experts_rather_than_dividing_by_zero():
+    """An expert's weight norm is never truly zero, so a zero means 'not measured'.
+    Clamping instead of masking would report that cell as the maximum."""
+    counts = torch.tensor([[4, 4, 4]])
+    m = drift_metrics(counts, torch.tensor([[1.0, 1.0, 1.0]]),
+                      weights=torch.tensor([[2.0, 2.0, 0.0]]))
+    assert m["update/rel_max"] == pytest.approx(0.5)
+
+
+def test_drift_metrics_drops_the_unnormalised_order_statistics():
+    """drift/mean, drift/max and drift/dead_mean are gone: the full matrix is in the
+    JSONL and an absolute norm is not comparable across layers anyway."""
+    m = drift_metrics(torch.tensor([[0, 1, 2, 3]]), torch.ones(1, 4),
+                      weights=torch.ones(1, 4))
+    assert set(k for k in m if k.startswith("drift/")) == {
+        "drift/corr_share_vs_update", "drift/dead_over_alive"}
 
 
 # ── the ExpertStats callback ─────────────────────────────────────────
@@ -167,7 +252,7 @@ def test_the_jsonl_is_the_wide_data_wandb_cannot_hold(tmp_path):
     """Dashboard gets correlations; the file gets the joint distribution they are
     computed from, per expert."""
     _, cap, records = _run(tmp_path, every=1, steps=2)
-    assert {"drift/corr_share_vs_update", "drift/mean"} <= set(cap.seen[0])
+    assert {"drift/corr_share_vs_update", "update/rel_max"} <= set(cap.seen[0])
     assert not any(k.startswith("drift/") and "layer" in k for k in cap.seen[0])
     counts = torch.tensor(records[0]["counts"])
     drift = torch.tensor(records[0]["drift"])
@@ -182,7 +267,7 @@ def test_no_file_and_no_drift_metrics_when_the_cadence_is_off(tmp_path):
 
 def test_drift_is_only_reported_on_cadence_steps(tmp_path):
     _, cap, _ = _run(tmp_path, every=3, steps=4)
-    has_drift = ["drift/mean" in m for m in cap.seen]
+    has_drift = ["drift/corr_share_vs_update" in m for m in cap.seen]
     assert has_drift == [True, False, False, True]
 
 

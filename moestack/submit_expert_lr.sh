@@ -120,7 +120,6 @@ COMMON=(
     "data.batch_size=$BATCH_SIZE" "data.grad_accum=$GRAD_ACCUM"
     "train.n_steps=$N_STEPS" "train.seed=$SEED"
     "logging.expert_stats_every=$STATS_EVERY" "train.save_every=$SAVE_EVERY"
-    "logging.load_stats_per_layer=true"
     "parallel.activation_checkpointing=$ACT_CKPT"
 )
 

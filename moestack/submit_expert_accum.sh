@@ -45,13 +45,12 @@
 # checkpoint, so periodic saves are the only thing that survives.
 #
 # What a resume costs: the open windows live in the gradient buffers and are NOT
-# checkpointed, so they are dropped on load and every expert restarts its window
-# empty (`accum/resumes` and `accum/resume_dropped_windows` say how often and how
-# many). The event history carries over. A cell with many resumes has lost a
-# little accumulated gradient that one with none has not -- check those two
-# series before comparing cells. moestack/README.md "Limits" has the reasoning.
+# checkpointed, so they are dropped on load (`accum/resumes` and
+# `accum/resume_dropped_windows` say how often and how many). The event history
+# carries over. A cell with many resumes has lost a little accumulated gradient
+# that one with none has not -- check those two series before comparing cells.
 #
-# Hence SAVE_EVERY is low and KEEP_LAST is set: a save costs ~5 min of the
+# Hence SAVE_EVERY is low and keep_last_n is set: a save costs ~5 min of the
 # ~53 min it now buys back, and without retention 20 saves x 59 GB would be
 # 1.2 TB per cell.
 #
@@ -76,17 +75,20 @@ set -euo pipefail
 # ===================================================================
 CSUB=/Users/ananyagupta/repos/getting-started/csub.py   # cluster wrapper, on this laptop
 # Overridable from the environment because they are about *where* a run happens,
-# not what it is:  REPO_DIR=looped-moe-accum bash moestack/submit_expert_accum.sh
-# lets this grid run from its own worktree while another branch's jobs keep using
-# the main checkout.
-REPO_DIR="${REPO_DIR:-looped-moe}"  # relative to the job's working dir (scratch home)
+# not what it is:  REPO_DIR=looped-moe bash moestack/submit_expert_accum.sh sends a
+# cell to the main checkout instead.
+#
+# Defaults to the accum worktree, NOT the main checkout: `looped-moe` sits on
+# refactor/baseline for the per-expert-LR runs, and none of optim.expert_accum
+# exists on that branch -- a cell submitted there dies on the first Hydra override.
+REPO_DIR="${REPO_DIR:-looped-moe-accum}"  # relative to the job's working dir (scratch home)
 VENV="${VENV:-.venv}"               # relative to REPO_DIR
 
 ARCH=deepseek                       # deepseek | olmoe | qwen3moe
 # Edit here, not from the command line. The grid is `regular`; drop to `tiny` for
 # a smoke test on a GPU and put it back afterwards. The run name carries the scale
 # either way, so a trial can never be mistaken for a cell.
-SCALE=regular                       # tiny | small | regular
+SCALE=tiny                          # tiny | small | regular
 OPTIMIZER=muon                      # accumulation requires muon (it raises under adamw)
 NODE_TYPE=h200
 GPUS=1                              # the mb cells are single-process only
@@ -121,7 +123,7 @@ EVENTS_EVERY=50                     # accumulation events JSONL cadence; 0 disab
 SAVE_EVERY=100
 KEEP_LAST=2                         # 59 GB a file; keep the resume point and one spare
 
-RELS="2 4 8"                        # Q, in multiples of a balanced expert's load
+RELS="1 1.5 2"                        # Q, in multiples of a balanced expert's load
 D_STEP=16                           # staleness cap on the step clock, in steps
 
 TIME=30h                            # per attempt; auto-resume carries a cell across several
@@ -160,7 +162,6 @@ COMMON=(
     "train.n_steps=$N_STEPS" "train.seed=$SEED"
     "logging.expert_stats_every=$STATS_EVERY" "train.save_every=$SAVE_EVERY"
     "train.keep_last_n=$KEEP_LAST"
-    "logging.load_stats_per_layer=true"
     "parallel.activation_checkpointing=$ACT_CKPT"
 )
 
@@ -244,6 +245,12 @@ trial_note=""
 Q_STEP=$(( BATCH_SIZE * GRAD_ACCUM * SEQ_LEN * GPUS * TOP_K / N_EXPERTS ))
 D_MB=$(( D_STEP * GRAD_ACCUM ))     # the same staleness, counted in the other tick
 
+# RELS may hold fractions (1.5x a balanced load), which $(( )) cannot multiply, and
+# `threshold` is an integer token count -- so round through awk.
+q_abs () {   # q_abs <rel> -> Q_STEP x rel in whole tokens
+    awk -v q="$Q_STEP" -v r="$1" 'BEGIN { printf "%d", q * r + 0.5 }'
+}
+
 echo "Submitting batch $BATCH  ${ONLY:+only='$ONLY'  }dry=$DRY$trial_note"
 echo "  $ARCH-$SCALE $OPTIMIZER lr=$LR  ${BATCH_SIZE}x${GRAD_ACCUM}x${SEQ_LEN} x ${N_STEPS} steps" \
      "on ${GPUS}x$NODE_TYPE  ($SEQUENCES sequences/cell)"
@@ -257,7 +264,7 @@ ACCUM=( "logging.accum_events_every=$EVENTS_EVERY" "optim.expert_accum.enabled=t
 
 # Balanced: the load-balancing loss does the work. What the grid has to beat.
 NOTES="balanced reference, aux $AUX_BASELINE, no accumulation" \
-run baseline "loss.aux_coef=$AUX_BASELINE"
+# run baseline "loss.aux_coef=$AUX_BASELINE"
 
 # Imbalanced and untouched: every expert updates every step, including the ones
 # that saw nothing. This is the regime the grid intervenes in.
@@ -297,10 +304,11 @@ done
 # Absolute Q and a converted D, so these differ from the st cells in exactly one
 # thing: when an expert may act on a full window, not how full it is.
 for r in $RELS; do
-    NOTES="micro-batch clock, Q=$(( Q_STEP * r )) tokens (${r}x per-step load), D=$D_MB ticks, aux 0" \
+    q="$(q_abs "$r")"
+    NOTES="micro-batch clock, Q=$q tokens (${r}x per-step load), D=$D_MB ticks, aux 0" \
     run "mb-r$r" "loss.aux_coef=0" "${ACCUM[@]}" \
         "optim.expert_accum.clock=microbatch" \
-        "optim.expert_accum.threshold=$(( Q_STEP * r ))" \
+        "optim.expert_accum.threshold=$q" \
         "optim.expert_accum.max_window=$D_MB"
 done
 

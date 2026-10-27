@@ -471,18 +471,27 @@ def _tally(state, event, tokens):
     return t
 
 
-def test_metrics_report_the_realised_budget_and_what_is_still_waiting():
+def test_metrics_report_the_realised_budget_and_the_update_cadence():
     s = AccumState.zeros(1, 4)
     s.observe(_counts([12, 11, 3, 0]))
     ev = s.ready(threshold=10, max_window=None)
     tokens = s.consume(ev.fire, step=0)
-    m = accum_metrics(s, _tally(s, ev, tokens), threshold=10)
+    m = accum_metrics(s, _tally(s, ev, tokens))
     assert m["accum/events_per_expert"] == 0.5
-    assert m["accum/waiting_fraction"] == 0.25        # the expert sitting on 3
-    assert m["accum/never_fired_fraction"] == 0.5
     assert m["accum/tokens_per_event_mean"] == 11.5
-    assert m["accum/overshoot_mean"] == pytest.approx(1.15)
     assert m["accum/timeout_fraction"] == 0.0
+
+
+def test_metrics_are_four_series_and_the_rest_is_in_the_jsonl():
+    """pending/age/overshoot and the waiting and never-fired fractions are all
+    functions of the `[L, E]` matrices written per event, so they are recomputed
+    offline rather than given a panel in every accumulation run."""
+    s = AccumState.zeros(1, 4)
+    s.observe(_counts([12, 11, 3, 0]))
+    ev = s.ready(threshold=10, max_window=None)
+    m = accum_metrics(s, _tally(s, ev, s.consume(ev.fire, step=0)))
+    assert set(m) == {"accum/events_per_expert", "accum/event_gini",
+                      "accum/tokens_per_event_mean", "accum/timeout_fraction"}
 
 
 def test_metrics_separate_a_timeout_from_a_met_budget():
@@ -490,7 +499,7 @@ def test_metrics_separate_a_timeout_from_a_met_budget():
     s.observe(_counts([50, 1]))
     s.age += 4
     ev = s.ready(threshold=10, max_window=4)
-    m = accum_metrics(s, _tally(s, ev, s.consume(ev.fire, 0)), threshold=10)
+    m = accum_metrics(s, _tally(s, ev, s.consume(ev.fire, 0)))
     assert m["accum/timeout_fraction"] == 0.5
 
 
@@ -498,7 +507,7 @@ def test_metrics_are_finite_when_nothing_fires():
     s = AccumState.zeros(1, 2)
     s.observe(_counts([1, 1]))
     ev = s.ready(threshold=10, max_window=None)
-    m = accum_metrics(s, _tally(s, ev, s.consume(ev.fire, 0)), threshold=10)
+    m = accum_metrics(s, _tally(s, ev, s.consume(ev.fire, 0)))
     assert m["accum/events_per_expert"] == 0.0
     assert all(not math.isnan(v) for v in m.values())
     assert "accum/tokens_per_event_mean" not in m
@@ -890,7 +899,7 @@ def test_counting_several_events_for_one_expert_keeps_the_rate_above_one():
         s.observe(_counts([10, 0]))
         ev = s.ready(threshold=10, max_window=None)
         t.add(ev, s.consume(ev.fire, 0))
-    m = accum_metrics(s, t, threshold=10)
+    m = accum_metrics(s, t)
     assert m["accum/events_per_expert"] == 1.5           # 3 events over 2 experts
     assert m["accum/tokens_per_event_mean"] == 10.0
 
@@ -1020,8 +1029,8 @@ def test_update_counts_have_their_own_inequality_measure():
     even.events += torch.tensor([[5, 5, 5, 5]])
     lopsided.events += torch.tensor([[20, 1, 1, 1]])
     t = EventTally(4)
-    assert accum_metrics(even, t, None)["accum/event_gini"] == 0.0
-    assert accum_metrics(lopsided, t, None)["accum/event_gini"] > 0.4
+    assert accum_metrics(even, t)["accum/event_gini"] == 0.0
+    assert accum_metrics(lopsided, t)["accum/event_gini"] > 0.4
 
 
 def _events_file(trainer):
@@ -1056,8 +1065,11 @@ def test_the_cadence_is_respected_and_zero_writes_nothing(tmp_path):
     t.fit()
     assert {r["step"] for r in _records(t)} <= {0, 2, 4}
 
-    off = Trainer(_accum_cfg(tmp_path / "off", steps=4, threshold=1, max_window=1),
-                  verbose=False)
+    # Explicitly 0: the default is non-zero now, because the four accum/* series
+    # are all the dashboard keeps and this file is the rest of the picture.
+    off_cfg = _accum_cfg(tmp_path / "off", steps=4, threshold=1, max_window=1)
+    off_cfg.logging.accum_events_every = 0
+    off = Trainer(off_cfg, verbose=False)
     off.fit()
     assert not _events_file(off).exists()
 

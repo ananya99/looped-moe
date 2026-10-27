@@ -18,7 +18,8 @@ import torch.nn as nn
 
 from . import checkpoint
 from .callbacks import (CallbackList, ConsoleLogger, ExpertAccumulation, ExpertStats,
-                        MoELoadStats, PerExpertLR, StepState, WandbLogger)
+                        ExpertGradStats, MoELoadStats, PerExpertLR, StepState,
+                        WandbLogger)
 from .config import Config
 from .data import build_eval_batches, build_train_iterator
 from .initialization import init_weights
@@ -58,12 +59,16 @@ class Trainer:
         self.optimizers = build_optimizers(self.model, cfg.optim, verbose=self.verbose,
                                            split_experts=split)
 
-        cbs = [MoELoadStats(cfg.logging.load_stats_per_layer)] if cfg.logging.load_stats else []
+        cbs = [MoELoadStats()] if cfg.logging.load_stats else []
         if cfg.optim.per_expert_lr.enabled:
             cbs.append(PerExpertLR(cfg.optim.per_expert_lr))
         if cfg.optim.expert_accum.enabled:
             cbs.append(ExpertAccumulation(cfg.optim.expert_accum,
                                           cfg.logging.accum_events_every))
+        if cfg.logging.grad_stats_every:
+            # Before ExpertStats: it publishes the [L, E] matrices that ExpertStats
+            # then writes to the JSONL, and both read at on_before_optimizer_step.
+            cbs.append(ExpertGradStats(cfg.logging.grad_stats_every))
         if cfg.logging.expert_stats_every:
             cbs.append(ExpertStats(cfg.logging.expert_stats_every))
         cbs += list(callbacks or [])
@@ -221,8 +226,9 @@ class Trainer:
             tot += batch_sum.item()
             n += int(batch_n)
         self.model.train()
-        loss = tot / max(n, 1)
-        return {"loss": loss, "perplexity": math.exp(min(loss, 20))}
+        # No `perplexity`: it is exp(loss), so it is the same curve on a different
+        # axis and the offline scripts can exponentiate.
+        return {"loss": tot / max(n, 1)}
 
     def save(self, name: str):
         if not self.dist.is_main:
@@ -316,7 +322,7 @@ class Trainer:
 
         if stopped:
             # No closing eval: the point is to be gone before the kill lands.
-            final = m or {"loss": float("nan"), "perplexity": float("nan")}
+            final = m or {"loss": float("nan")}
         else:
             # Last chance to close any window still open: after this the weights are
             # saved and the run is over. A stopped run deliberately does *not* flush

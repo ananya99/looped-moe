@@ -7,6 +7,7 @@
 #   bash moestack/submit_expert_accum.sh st-r4            # just this one (exact name)
 #   bash moestack/submit_expert_accum.sh --dry | grep '>>'    # print, submit nothing
 #   bash moestack/submit_expert_accum.sh --trial mb-r4    # 100 steps, wandb tag "trial"
+#   bash moestack/submit_expert_accum.sh --config moe4_top1   # same grid, other base config
 #
 # The question: the baseline gives every expert one update per step, built from
 # whatever the router happened to send it -- a big-batch estimate for a hot
@@ -26,6 +27,23 @@
 #   mb-r{2,4,8}  micro-batch clock, the SAME absolute Q
 #   st-r4-sum    step clock, grad_scale=sum     is dividing by the window's tokens
 #                                               doing anything?
+#
+# --config picks the Hydra base config (moestack/conf/<name>.yaml, default
+# `baseline`); a path is accepted too, so --config moestack/conf/moe4_top1.yaml and
+# --config moe4_top1 mean the same thing. The grid, the cells and every override
+# below are unchanged -- only what they compose over moves. Two consequences:
+#
+#   - COMMON still wins for the knobs it names (arch, scale, optimizer, lr, batch
+#     shape, n_steps). A config is for what COMMON does *not* set -- model.overrides,
+#     say. If it disagrees about arch or scale, the script says so and stops.
+#   - The routing shape comes from the config when it sets one, so the balanced load
+#     the banner prints is the real one: moe4_top1 is 4 experts top-1, which is
+#     131,072 tokens/expert/step, not baseline's 49,152. threshold_rel is resolved
+#     from the live config inside the trainer either way.
+#
+# A non-default config goes into the k8s job name (ea-moe4_top1-mb-r1-<batch>), so
+# two configs can share a --batch. Run names already differ: anything under
+# model.overrides feeds the fingerprint.
 #
 # Two conversions the grid depends on, both easy to get wrong:
 #
@@ -82,6 +100,11 @@ CSUB=/Users/ananyagupta/repos/getting-started/csub.py   # cluster wrapper, on th
 # exists on that branch -- a cell submitted there dies on the first Hydra override.
 REPO_DIR="${REPO_DIR:-looped-moe-accum}"  # relative to the job's working dir (scratch home)
 VENV="${VENV:-.venv}"               # relative to REPO_DIR
+
+# The Hydra base config these cells compose over: moestack/conf/<CONFIG>.yaml.
+# --config overrides it. See the --config notes at the top for what COMMON still
+# wins, and what the config is therefore for.
+CONFIG=baseline                     # baseline | moe4_top1 | ...
 
 ARCH=deepseek                       # deepseek | olmoe | qwen3moe
 # Edit here, not from the command line. The grid is `regular`; drop to `tiny` for
@@ -145,12 +168,62 @@ while [ $# -gt 0 ]; do
                    [ -n "$BATCH" ] || { echo "--batch needs a tag, e.g. --batch b1019-1500" >&2; exit 1; } ;;
         --batch=*) BATCH="${1#--batch=}"; shift
                    [ -n "$BATCH" ] || { echo "--batch needs a tag" >&2; exit 1; } ;;
-        -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
+        --config)  shift; CONFIG="${1:-}"; shift || true
+                   [ -n "$CONFIG" ] || { echo "--config needs a name, e.g. --config moe4_top1" >&2; exit 1; } ;;
+        --config=*) CONFIG="${1#--config=}"; shift
+                   [ -n "$CONFIG" ] || { echo "--config needs a name" >&2; exit 1; } ;;
+        -h|--help) sed -n '2,55p' "$0"; exit 0 ;;
         -*)        echo "unknown flag: $1 (try --help)" >&2; exit 1 ;;
         *)         break ;;
     esac
 done
 ONLY="${1:-}"
+
+# --- the base config -------------------------------------------------------
+# A path is accepted as well as a bare name, so --config moestack/conf/moe4_top1.yaml
+# and --config moe4_top1 are the same thing.
+CONFIG="$(basename "$CONFIG" .yaml)"
+CONF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/conf" && pwd)"
+CONFIG_FILE="$CONF_DIR/$CONFIG.yaml"
+[ -f "$CONFIG_FILE" ] || {
+    echo "no such config: $CONFIG_FILE" >&2
+    echo "available: $(cd "$CONF_DIR" && ls ./*.yaml | xargs -n1 basename | sed 's/\.yaml$//' \
+          | paste -sd' ' -)" >&2
+    exit 1; }
+
+# `key: value` from the chosen config. Read for the banner and the guard below
+# only -- the trainer loads the file itself, so this never becomes an override and
+# cannot change what runs. A crude parse is therefore safe: at worst a number in
+# the banner is wrong, which is visible.
+conf_val () {
+    sed -n "s/^[[:space:]]*$1:[[:space:]]*\([A-Za-z0-9_.-]\{1,\}\).*/\1/p" "$CONFIG_FILE" | tail -1
+}
+
+# COMMON passes model.arch and model.scale and Hydra's last value wins, so a
+# config that disagrees would be overridden without a word -- the one way a custom
+# config can quietly train a model nobody asked for.
+check_clobber () {   # <yaml key> <script variable> <its value>
+    local v; v="$(conf_val "$1")"
+    if [ -n "$v" ] && [ "$v" != "$3" ]; then
+        echo "ERROR: $CONFIG.yaml sets model.$1=$v, but COMMON passes model.$1=$3," >&2
+        echo "       and Hydra's last value wins. Set $2=$v at the top of this script," >&2
+        echo "       or drop model.$1 from COMMON." >&2
+        exit 1
+    fi
+}
+check_clobber arch  ARCH  "$ARCH"
+check_clobber scale SCALE "$SCALE"
+
+# A config may set its own routing shape under model.overrides, which changes what
+# a balanced expert's load is. Prefer it over the per-arch table above, so the
+# banner states the budget the cells will actually use.
+_e="$(conf_val n_experts)"; [ -n "$_e" ] && N_EXPERTS="$_e"
+_k="$(conf_val top_k)";     [ -n "$_k" ] && TOP_K="$_k"
+
+# Non-default configs go into the job name so two of them can share a --batch.
+# Run names need no help: anything under model.overrides feeds the fingerprint.
+CONFIG_SLUG=""
+[ "$CONFIG" = baseline ] || CONFIG_SLUG="$CONFIG-"
 
 # Applied to every cell. These equal the conf/baseline.yaml defaults as shipped, so
 # they do not move the run-name fingerprint -- they are here so the file states the
@@ -198,7 +271,7 @@ run () {   # [NOTES=..] [RESUME=1] run <name> <extra hydra overrides...>
     local notes="${NOTES:-}" resume="${RESUME:-1}"
     local secs; secs="$(to_seconds "$TIME")"   # validated before anything is submitted
     local job
-    job="$(echo "$JOB_PREFIX-$base-$BATCH" | tr '[:upper:]' '[:lower:]' \
+    job="$(echo "$JOB_PREFIX-$CONFIG_SLUG$base-$BATCH" | tr '[:upper:]' '[:lower:]' \
            | tr '_.' '--' | tr -cd 'a-z0-9-' | cut -c1-63)"
 
     # ${arr[@]+"${arr[@]}"}: macOS bash 3.2 calls an empty array unbound under set -u
@@ -216,8 +289,10 @@ run () {   # [NOTES=..] [RESUME=1] run <name> <extra hydra overrides...>
     fi
     n_matched=$((n_matched + 1))
 
-    local launcher="python -m moestack.train"
-    [ "$GPUS" -gt 1 ] && launcher="torchrun --standalone --nproc_per_node=$GPUS -m moestack.train"
+    # --config-name is Hydra's, not an override, so it goes on the launcher rather
+    # than into the overrides array.
+    local launcher="python -m moestack.train --config-name $CONFIG"
+    [ "$GPUS" -gt 1 ] && launcher="torchrun --standalone --nproc_per_node=$GPUS -m moestack.train --config-name $CONFIG"
 
     local args="" o
     for o in "${overrides[@]}"; do args+=" $(printf %q "$o")"; done
@@ -249,9 +324,11 @@ Q_STEP=$(( BATCH_SIZE * GRAD_ACCUM * SEQ_LEN * GPUS * TOP_K / N_EXPERTS ))
 D_MB=$(( D_STEP * GRAD_ACCUM ))     # the same staleness, counted in the other tick
 
 echo "Submitting batch $BATCH  ${ONLY:+only='$ONLY'  }dry=$DRY$trial_note"
-echo "  $ARCH-$SCALE $OPTIMIZER lr=$LR  ${BATCH_SIZE}x${GRAD_ACCUM}x${SEQ_LEN} x ${N_STEPS} steps" \
+echo "  conf/$CONFIG.yaml  $ARCH-$SCALE $OPTIMIZER lr=$LR" \
+     "${BATCH_SIZE}x${GRAD_ACCUM}x${SEQ_LEN} x ${N_STEPS} steps" \
      "on ${GPUS}x$NODE_TYPE  ($SEQUENCES sequences/cell)"
-echo "  balanced load $Q_STEP tokens/expert/step; D=$D_STEP steps = $D_MB micro-batches"
+echo "  $N_EXPERTS experts top-$TOP_K: balanced load $Q_STEP tokens/expert/step;" \
+     "D=$D_STEP steps = $D_MB micro-batches"
 
 ACCUM=( "logging.accum_events_every=$EVENTS_EVERY" "optim.expert_accum.enabled=true" )
 

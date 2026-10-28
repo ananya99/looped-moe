@@ -1,0 +1,124 @@
+# Baseline MoE pretraining (moestack). Defaults reproduce imbalance_train.py's
+# baseline cell (deepseek-tiny, Muon, aux 0.01, z 1e-4) -- see moestack/README.md.
+# Override anything on the CLI:  python -m moestack.train loss.aux_coef=0 train.seed=1
+# Every field of moestack/config.py is overridable (the dataclasses are the schema).
+
+defaults:
+  - moestack_schema
+  - _self_
+
+model:
+  arch: deepseek          # deepseek | olmoe | qwen3moe
+  scale: tiny             # tiny | small | regular (width only; depth fixed per arch)
+  experts_impl: grouped_mm
+  # ModelConfig has no n_experts/top_k of its own: `overrides` is the escape hatch
+  # onto ModelArgs, and anything set here feeds the run-name fingerprint, so these
+  # cells cannot collide with a 64-expert run's checkpoints.
+  overrides:
+    n_experts: 4
+    top_k: 1
+    norm_topk_prob: false
+
+loss:
+  aux_coef: 0.01          # load balancing; 0 = no balancing pressure
+  z_coef: 1.0e-4          # router z-loss
+
+optim:
+  name: muon              # muon (Muon for matrices + AdamW for the rest) | adamw
+  lr: 0.02
+  min_lr_ratio: 0.1
+  warmup_steps: 100
+  grad_clip: 1.0
+  # Per-expert learning rates. Off by default: alpha=0 with freeze_dead=false
+  # makes every multiplier exactly 1.0 and the run is the plain baseline.
+  #   optim.per_expert_lr.alpha=0.5        lr_e proportional to sqrt(token share)
+  #   optim.per_expert_lr.freeze_dead=true zero-token experts take no step at all
+  per_expert_lr:
+    alpha: 0.0
+    freeze_dead: false
+    ema: 0.9              # smoothing of the counts the rule reads; 0 = raw counts
+    normalize: true       # keep the mean rate over alive experts at 1.0
+    clamp_min: 1.0e-3
+    clamp_max: 10.0
+  # Expert-local gradient accumulation. Off by default; enabling it fixes the
+  # token budget per update instead of the clock, so hot experts update more
+  # often and cold ones accumulate until they have something to say.
+  #   optim.expert_accum.enabled=true optim.expert_accum.threshold_rel=2 \
+  #     optim.expert_accum.max_window=8
+  # threshold_rel counts multiples of a balanced expert's per-tick load (~49k
+  # tokens per step at 16x16x2048 with 64 experts and top-6). Not resumable:
+  # the open windows live in the gradient buffers, which are not checkpointed.
+  expert_accum:
+    enabled: false
+    clock: step           # step | microbatch (microbatch not wired up yet)
+    threshold: null       # Q in routed tokens; or set threshold_rel instead
+    threshold_rel: null   # Q as a multiple of a balanced expert's per-tick load
+    max_window: null      # D, the staleness cap, in ticks
+    grad_scale: mean      # mean = divide an event by the tokens it was built from
+
+parallel:
+  dp: -1                  # -1 = all ranks
+  ep: 1                   # >1 not implemented yet (fails loudly)
+  tp: 1
+  compile: false
+  activation_checkpointing: false
+  mixed_precision: bf16
+
+data:
+  # disk = the pre-tokenized cache (see moestack/prepare_data.py). Same sequences
+  # as `stream`, but read from a memmap: no 5-50 min shuffle-buffer fill, no
+  # DataLoader workers to hang mid-run, and resume seeks instead of replaying.
+  # 1.16B tokens = 2,211 steps at 16x16x2048; past that it wraps to a 2nd epoch.
+  # Use source=stream to go back to the Hub, source=synthetic for smoke tests.
+  source: disk            # stream | disk | synthetic
+  cache_dir: /mloscratch/homes/anagupta/data/dclm-fp-1.2B
+  seq_len: 2048
+  batch_size: 16          # per rank
+  grad_accum: 16
+  num_workers: 4          # stream only; disk needs no workers
+  # 40 x 16 x 2048 = 1.31M tokens of holdout, taken from the tail of the cache.
+  # Raising this extends the slice backwards, so a 10-batch run's eval set is the
+  # last quarter of this one -- a subset, but not the same number.
+  eval_batches: 40
+
+train:
+  n_steps: 2000
+  seed: 42
+  log_every: 10
+  # 10 points over the default 2,000 steps, for well under 1% of the compute: at
+  # 500 a cell that dies early has no held-out curve at all, and most die early.
+  eval_every: 200
+  save_every: 500
+  save_dir: checkpoints
+  auto_resume: false
+  dry_run: false
+
+logging:
+  wandb: true
+  project: moe-baseline
+  tag: null
+  load_stats: true
+  # Per-expert JSONL + the drift/* metrics derived from it (incl. drift/rel, the
+  # interval ||dw||/||w||; update/rel is grad_stats_every's, per event), every N
+  # steps (0 = off). The file is <save_dir>/<run_name>_expert_stats.jsonl. wandb
+  # gets a dozen aggregates; this file gets the `[L, E]` matrices they came from,
+  # and is the only copy -- at 0 the per-layer and per-expert picture is lost, not
+  # merely unplotted.
+  expert_stats_every: 50
+  # Same bargain for the accumulation controller: four accum/* series on the
+  # dashboard, the full per-event `[L, E]` picture here.
+  accum_events_every: 50
+  # Per-expert gradient SNR every N steps (0 = off). Hooks are armed only on
+  # measured steps. Rides the expert_stats JSONL, so keep the two cadences equal.
+  grad_stats_every: 50
+  # routing/{entropy,confidence,margin}: how decisively the router assigns, as
+  # against how evenly (load/*). Entropy is in nats; the ceiling is log(n_experts).
+  routing_stats_every: 50
+  # Compass alignment factors (arXiv:2610.04140), measured not applied. Muon only.
+  compass_stats_every: 0
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${train.save_dir}/hydra/${now:%Y-%m-%d_%H-%M-%S}

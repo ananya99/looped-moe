@@ -214,7 +214,7 @@ class TrainConfig:
     n_steps: int = 2_000
     seed: int = 42
     log_every: int = 10
-    eval_every: int = 100
+    eval_every: int = 200
     save_every: int = 500
     # How many `_step*.pt` files to keep, newest first (0 = keep every one, the
     # original behaviour). A full-state checkpoint is the model plus the optimizer
